@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -421,6 +422,35 @@ func TestBuildCheckPayload(t *testing.T) {
 	}
 	if len(failure.Execution.Errors) != 1 || failure.Execution.Errors[0] != "parse failure" {
 		t.Fatalf("expected structured execution errors in payload, got %v", failure.Execution.Errors)
+	}
+
+	minimalCheck := CustodianCheck{
+		Index:    1,
+		Name:     "minimal-check",
+		Resource: "aws.s3",
+		Provider: "aws",
+		RawPolicy: map[string]interface{}{
+			"name":     "minimal-check",
+			"resource": "aws.s3",
+		},
+	}
+	minimal := buildCheckPayload(minimalCheck, CustodianExecutionResult{
+		StartedAt: now,
+		EndedAt:   now,
+		ExitCode:  0,
+		Resources: []interface{}{},
+	})
+
+	rawJSON, err := json.Marshal(minimal)
+	if err != nil {
+		t.Fatalf("failed to marshal minimal payload: %v", err)
+	}
+	jsonText := string(rawJSON)
+	if strings.Contains(jsonText, `"metadata":{}`) {
+		t.Fatalf("expected metadata to be omitted when empty, got: %s", jsonText)
+	}
+	if strings.Contains(jsonText, `"errors":[]`) {
+		t.Fatalf("expected execution.errors to be omitted when empty, got: %s", jsonText)
 	}
 }
 

@@ -394,12 +394,20 @@ func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult)
 		durationMS = 0
 	}
 
-	metadata := map[string]interface{}{}
+	var metadata map[string]interface{}
 	for k, v := range check.RawPolicy {
 		if k == "name" || k == "resource" {
 			continue
 		}
+		if metadata == nil {
+			metadata = map[string]interface{}{}
+		}
 		metadata[k] = v
+	}
+
+	var executionErrors []string
+	if len(execution.Errors) > 0 {
+		executionErrors = append([]string{}, execution.Errors...)
 	}
 
 	return &StandardizedCheckPayload{
@@ -422,7 +430,7 @@ func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult)
 			Stdout:     execution.Stdout,
 			Stderr:     execution.Stderr,
 			Error:      execution.Error,
-			Errors:     append([]string{}, execution.Errors...),
+			Errors:     executionErrors,
 		},
 		Result: StandardizedCheckResult{
 			MatchedResourceCount: len(execution.Resources),
