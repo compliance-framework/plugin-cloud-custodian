@@ -892,20 +892,13 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 		},
 	}
 
-	inventoryLinks := []*proto.Link{}
-	if payload.Result.ArtifactPath != "" {
-		inventoryLinks = append(inventoryLinks, &proto.Link{Href: payload.Result.ArtifactPath, Text: policyManager.Pointer("Custodian Artifact Directory")})
-	}
-	if payload.Result.ResourcesPath != "" {
-		inventoryLinks = append(inventoryLinks, &proto.Link{Href: payload.Result.ResourcesPath, Text: policyManager.Pointer("Custodian resources.json")})
-	}
-
 	inventory := []*proto.InventoryItem{
 		{
 			Identifier: checkID,
 			Type:       "cloud-custodian-check",
 			Title:      fmt.Sprintf("Cloud Custodian Check %s", payload.Check.Name),
-			Links:      inventoryLinks,
+			// Local temp artifact paths are intentionally not exposed in evidence links
+			// because they are ephemeral and not portable for downstream consumers.
 			ImplementedComponents: []*proto.InventoryItemImplementedComponent{
 				{Identifier: "cloud-custodian/runtime"},
 				{Identifier: providerID},
