@@ -176,6 +176,16 @@ func TestResolvePoliciesYAML(t *testing.T) {
 			t.Fatalf("expected error for unsupported scheme")
 		}
 	})
+
+	t.Run("windows style path treated as local path", func(t *testing.T) {
+		_, err := resolvePoliciesYAML(context.Background(), "", `C:\policies.yaml`)
+		if err == nil {
+			t.Fatalf("expected local file read error for missing windows-style path")
+		}
+		if !strings.Contains(err.Error(), "failed to read local policies file") {
+			t.Fatalf("expected local file read path handling, got: %v", err)
+		}
+	})
 }
 
 func TestParseCustodianChecks(t *testing.T) {
@@ -408,6 +418,7 @@ func (f *fakeExecutor) Execute(ctx context.Context, req CustodianExecutionReques
 type fakePolicyEvaluator struct {
 	calls      []string
 	failChecks map[string]bool
+	labelsSeen []map[string]string
 }
 
 func (f *fakePolicyEvaluator) Generate(
@@ -427,6 +438,11 @@ func (f *fakePolicyEvaluator) Generate(
 	}
 
 	f.calls = append(f.calls, fmt.Sprintf("%s|%s|%s", payload.Check.Name, policyPath, payload.Execution.Status))
+	copiedLabels := map[string]string{}
+	for k, v := range labels {
+		copiedLabels[k] = v
+	}
+	f.labelsSeen = append(f.labelsSeen, copiedLabels)
 	if f.failChecks[payload.Check.Name] {
 		return nil, errors.New("forced evaluator error")
 	}
@@ -551,6 +567,58 @@ func TestEvalLoopBehavior(t *testing.T) {
 		}
 		if apiHelper.calls != 0 {
 			t.Fatalf("expected no evidence submission, got %d calls", apiHelper.calls)
+		}
+	})
+
+	t.Run("preserves user provider label and adds source labels", func(t *testing.T) {
+		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"check-a": {
+				StartedAt: now,
+				EndedAt:   now,
+				ExitCode:  0,
+				Resources: []interface{}{},
+			},
+		}}
+
+		evaluator := &fakePolicyEvaluator{}
+		apiHelper := &fakeAPIHelper{}
+
+		plugin := &CloudCustodianPlugin{
+			Logger: hclog.NewNullLogger(),
+			parsedConfig: &ParsedConfig{
+				PolicyLabels: map[string]string{"provider": "custom-provider", "team": "platform"},
+				CheckTimeout: 30 * time.Second,
+			},
+			checks: []CustodianCheck{
+				{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+			},
+			executor:  executor,
+			evaluator: evaluator,
+		}
+
+		resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+		if err != nil {
+			t.Fatalf("unexpected eval error: %v", err)
+		}
+		if resp.GetStatus() != proto.ExecutionStatus_SUCCESS {
+			t.Fatalf("expected success status, got %s", resp.GetStatus().String())
+		}
+		if len(evaluator.labelsSeen) == 0 {
+			t.Fatalf("expected evaluator to capture labels")
+		}
+
+		labels := evaluator.labelsSeen[0]
+		if labels["provider"] != "custom-provider" {
+			t.Fatalf("expected provider label to be preserved, got: %s", labels["provider"])
+		}
+		if labels["source"] != sourceCloudCustodian {
+			t.Fatalf("expected source label, got: %s", labels["source"])
+		}
+		if labels["tool"] != sourceCloudCustodian {
+			t.Fatalf("expected tool label, got: %s", labels["tool"])
+		}
+		if labels["check_provider"] != "aws" {
+			t.Fatalf("expected check_provider label to be aws, got: %s", labels["check_provider"])
 		}
 	})
 }

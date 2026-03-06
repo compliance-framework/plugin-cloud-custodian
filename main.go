@@ -32,6 +32,7 @@ const (
 	defaultCheckTimeoutSeconds = 300
 	schemaVersionV1            = "v1"
 	sourceCloudCustodian       = "cloud-custodian"
+	defaultRemotePolicyTimeout = 30 * time.Second
 )
 
 var lookPath = exec.LookPath
@@ -325,12 +326,12 @@ func findResourcesJSON(outputDir string) (string, error) {
 		}
 		if d.Name() == "resources.json" {
 			found = path
-			return io.EOF
+			return filepath.SkipAll
 		}
 		return nil
 	})
 
-	if err != nil && !errors.Is(err, io.EOF) {
+	if err != nil && !errors.Is(err, filepath.SkipAll) {
 		return "", err
 	}
 	if found == "" {
@@ -548,6 +549,16 @@ func resolvePoliciesYAML(ctx context.Context, inlineYAML string, policiesPath st
 		return nil, errors.New("policies path is required when policies_yaml is empty")
 	}
 
+	// Treat values that do not look like URLs as local filesystem paths.
+	// This handles Windows paths like `C:\policies.yaml` correctly.
+	if !strings.Contains(pathValue, "://") {
+		content, err := os.ReadFile(pathValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read local policies file: %w", err)
+		}
+		return content, nil
+	}
+
 	parsedURL, err := url.Parse(pathValue)
 	if err != nil {
 		return nil, fmt.Errorf("invalid policies_path: %w", err)
@@ -574,7 +585,8 @@ func resolvePoliciesYAML(ctx context.Context, inlineYAML string, policiesPath st
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request for policies_path: %w", err)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		httpClient := &http.Client{Timeout: defaultRemotePolicyTimeout}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch policies_path: %w", err)
 		}
@@ -824,7 +836,11 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 	)
 	labels := map[string]string{}
 	maps.Copy(labels, p.parsedConfig.PolicyLabels)
-	labels["provider"] = sourceCloudCustodian
+	labels["source"] = sourceCloudCustodian
+	labels["tool"] = sourceCloudCustodian
+	if _, exists := labels["provider"]; !exists {
+		labels["provider"] = payload.Check.Provider
+	}
 	labels["type"] = "check"
 	labels["check_name"] = payload.Check.Name
 	labels["check_resource"] = payload.Check.Resource
