@@ -170,6 +170,23 @@ func TestResolvePoliciesYAML(t *testing.T) {
 		}
 	})
 
+	t.Run("http response too large", func(t *testing.T) {
+		oversized := strings.Repeat("a", defaultMaxRemotePolicyBytes+1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(oversized))
+		}))
+		defer srv.Close()
+
+		_, err := resolvePoliciesYAML(context.Background(), "", srv.URL)
+		if err == nil {
+			t.Fatalf("expected error for oversized response body")
+		}
+		if !strings.Contains(err.Error(), "too large") {
+			t.Fatalf("expected oversized body error, got: %v", err)
+		}
+	})
+
 	t.Run("unsupported scheme", func(t *testing.T) {
 		_, err := resolvePoliciesYAML(context.Background(), "", "s3://bucket/policies.yaml")
 		if err == nil {
@@ -344,8 +361,14 @@ sleep 2
 		if !strings.Contains(result.Error, "deadline exceeded") {
 			t.Fatalf("expected deadline exceeded in error, got: %s", result.Error)
 		}
-		if len(result.Errors) == 0 {
-			t.Fatalf("expected structured execution errors")
+		deadlineMentions := 0
+		for _, msg := range result.Errors {
+			if strings.Contains(msg, "deadline exceeded") {
+				deadlineMentions++
+			}
+		}
+		if deadlineMentions > 1 {
+			t.Fatalf("expected at most one deadline exceeded entry, got: %v", result.Errors)
 		}
 	})
 }

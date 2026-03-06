@@ -29,10 +29,11 @@ import (
 )
 
 const (
-	defaultCheckTimeoutSeconds = 300
-	schemaVersionV1            = "v1"
-	sourceCloudCustodian       = "cloud-custodian"
-	defaultRemotePolicyTimeout = 30 * time.Second
+	defaultCheckTimeoutSeconds  = 300
+	schemaVersionV1             = "v1"
+	sourceCloudCustodian        = "cloud-custodian"
+	defaultRemotePolicyTimeout  = 30 * time.Second
+	defaultMaxRemotePolicyBytes = 1 << 20 // 1 MiB
 )
 
 var lookPath = exec.LookPath
@@ -261,9 +262,13 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		result.Err = fmt.Errorf("custodian execution failed: %w", err)
 		result.Errors = append(result.Errors, result.Err.Error())
 	}
-	if runCtx.Err() != nil {
-		result.Err = errors.Join(result.Err, runCtx.Err())
-		result.Errors = append(result.Errors, runCtx.Err().Error())
+	if runErr := runCtx.Err(); runErr != nil {
+		// Avoid duplicating context timeout/cancel errors when cmd.Run already
+		// returned an error that wraps the same context failure.
+		if err == nil || !errors.Is(err, runErr) {
+			result.Err = errors.Join(result.Err, runErr)
+			result.Errors = append(result.Errors, runErr.Error())
+		}
 	}
 	if resourcesErr != nil {
 		result.Err = errors.Join(result.Err, resourcesErr)
@@ -595,10 +600,16 @@ func resolvePoliciesYAML(ctx context.Context, inlineYAML string, policiesPath st
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, fmt.Errorf("unexpected status code %d while fetching policies_path", resp.StatusCode)
 		}
+		if resp.ContentLength > defaultMaxRemotePolicyBytes {
+			return nil, fmt.Errorf("policies_path response too large: content-length=%d exceeds max=%d bytes", resp.ContentLength, defaultMaxRemotePolicyBytes)
+		}
 
-		content, err := io.ReadAll(resp.Body)
+		content, err := io.ReadAll(io.LimitReader(resp.Body, defaultMaxRemotePolicyBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read policies_path response body: %w", err)
+		}
+		if len(content) > defaultMaxRemotePolicyBytes {
+			return nil, fmt.Errorf("policies_path response too large: size=%d exceeds max=%d bytes", len(content), defaultMaxRemotePolicyBytes)
 		}
 		return content, nil
 	default:
