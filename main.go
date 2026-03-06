@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,20 +38,24 @@ var lookPath = exec.LookPath
 
 // PluginConfig receives string-only config from the agent gRPC interface.
 type PluginConfig struct {
-	PoliciesYAML        string `mapstructure:"policies_yaml"`
-	PoliciesPath        string `mapstructure:"policies_path"`
-	CustodianBinary     string `mapstructure:"custodian_binary"`
-	PolicyLabels        string `mapstructure:"policy_labels"`
-	CheckTimeoutSeconds string `mapstructure:"check_timeout_seconds"`
+	PoliciesYAML          string `mapstructure:"policies_yaml"`
+	PoliciesPath          string `mapstructure:"policies_path"`
+	CustodianBinary       string `mapstructure:"custodian_binary"`
+	PolicyLabels          string `mapstructure:"policy_labels"`
+	CheckTimeoutSeconds   string `mapstructure:"check_timeout_seconds"`
+	DebugDumpPayloads     string `mapstructure:"debug_dump_payloads"`
+	DebugPayloadOutputDir string `mapstructure:"debug_payload_output_dir"`
 }
 
 // ParsedConfig stores normalized and validated values for runtime use.
 type ParsedConfig struct {
-	PoliciesYAML    string
-	PoliciesPath    string
-	CustodianBinary string
-	PolicyLabels    map[string]string
-	CheckTimeout    time.Duration
+	PoliciesYAML          string
+	PoliciesPath          string
+	CustodianBinary       string
+	PolicyLabels          map[string]string
+	CheckTimeout          time.Duration
+	DebugDumpPayloads     bool
+	DebugPayloadOutputDir string
 }
 
 func (c *PluginConfig) Parse() (*ParsedConfig, error) {
@@ -90,12 +95,31 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		return nil, fmt.Errorf("could not resolve custodian binary %q: %w", binary, err)
 	}
 
+	debugDumpPayloads := false
+	if strings.TrimSpace(c.DebugDumpPayloads) != "" {
+		parsedDebug, err := strconv.ParseBool(c.DebugDumpPayloads)
+		if err != nil {
+			return nil, fmt.Errorf("debug_dump_payloads must be a boolean value: %w", err)
+		}
+		debugDumpPayloads = parsedDebug
+	}
+
+	debugPayloadOutputDir := strings.TrimSpace(c.DebugPayloadOutputDir)
+	if debugPayloadOutputDir != "" {
+		debugDumpPayloads = true
+	}
+	if debugDumpPayloads && debugPayloadOutputDir == "" {
+		debugPayloadOutputDir = "debug-standardized-payloads"
+	}
+
 	return &ParsedConfig{
-		PoliciesYAML:    inlineYAML,
-		PoliciesPath:    policiesPath,
-		CustodianBinary: resolvedBinary,
-		PolicyLabels:    policyLabels,
-		CheckTimeout:    time.Duration(checkTimeoutSeconds) * time.Second,
+		PoliciesYAML:          inlineYAML,
+		PoliciesPath:          policiesPath,
+		CustodianBinary:       resolvedBinary,
+		PolicyLabels:          policyLabels,
+		CheckTimeout:          time.Duration(checkTimeoutSeconds) * time.Second,
+		DebugDumpPayloads:     debugDumpPayloads,
+		DebugPayloadOutputDir: debugPayloadOutputDir,
 	}, nil
 }
 
@@ -143,6 +167,15 @@ type CommandCustodianExecutor struct {
 }
 
 func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExecutionRequest) CustodianExecutionResult {
+	e.Logger.Debug("Starting cloud custodian execution",
+		"check_name", req.Check.Name,
+		"check_index", req.Check.Index,
+		"resource", req.Check.Resource,
+		"provider", req.Check.Provider,
+		"binary", req.BinaryPath,
+		"timeout", req.Timeout.String(),
+		"output_dir", req.OutputDir,
+	)
 	result := CustodianExecutionResult{
 		StartedAt:    time.Now().UTC(),
 		ExitCode:     -1,
@@ -155,9 +188,11 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		result.Err = fmt.Errorf("failed to create output directory: %w", err)
 		result.Error = result.Err.Error()
 		result.Errors = []string{result.Error}
+		e.Logger.Error("Failed creating output directory for check", "check_name", req.Check.Name, "error", result.Error)
 		result.EndedAt = time.Now().UTC()
 		return result
 	}
+	e.Logger.Trace("Created output directory for check", "check_name", req.Check.Name, "output_dir", req.OutputDir)
 
 	policyDocument := map[string]interface{}{
 		"policies": []map[string]interface{}{req.Check.RawPolicy},
@@ -167,6 +202,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		result.Err = fmt.Errorf("failed to marshal single policy document: %w", err)
 		result.Error = result.Err.Error()
 		result.Errors = []string{result.Error}
+		e.Logger.Error("Failed marshaling single policy yaml for check", "check_name", req.Check.Name, "error", result.Error)
 		result.EndedAt = time.Now().UTC()
 		return result
 	}
@@ -176,14 +212,26 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		result.Err = fmt.Errorf("failed to write single policy file: %w", err)
 		result.Error = result.Err.Error()
 		result.Errors = []string{result.Error}
+		e.Logger.Error("Failed writing single policy file for check", "check_name", req.Check.Name, "policy_path", policyPath, "error", result.Error)
 		result.EndedAt = time.Now().UTC()
 		return result
 	}
+	e.Logger.Trace("Wrote single policy file", "check_name", req.Check.Name, "policy_path", policyPath)
 
 	runCtx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, req.BinaryPath, "run", "--dryrun", "-s", req.OutputDir, policyPath)
+	args := []string{"run", "--dryrun", "-s", req.OutputDir, policyPath}
+	if strings.EqualFold(req.Check.Provider, "aws") {
+		// Ensure AWS policies evaluate across all regions by default.
+		args = append(args, "--region", "all")
+	}
+	cmd := exec.CommandContext(runCtx, req.BinaryPath, args...)
+	e.Logger.Debug("Executing custodian command",
+		"check_name", req.Check.Name,
+		"command", req.BinaryPath,
+		"args", args,
+	)
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -195,6 +243,12 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	if cmd.ProcessState != nil {
 		result.ExitCode = cmd.ProcessState.ExitCode()
 	}
+	e.Logger.Debug("Custodian command finished",
+		"check_name", req.Check.Name,
+		"exit_code", result.ExitCode,
+		"stdout_len", len(result.Stdout),
+		"stderr_len", len(result.Stderr),
+	)
 
 	resourcesPath, resources, resourcesErr := readResourcesArtifact(req.OutputDir)
 	result.ResourcesPath = resourcesPath
@@ -217,6 +271,17 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 
 	if result.Err != nil {
 		result.Error = strings.Join(result.Errors, "; ")
+		e.Logger.Warn("Custodian execution completed with errors",
+			"check_name", req.Check.Name,
+			"error_count", len(result.Errors),
+			"errors", result.Errors,
+		)
+	} else {
+		e.Logger.Debug("Custodian execution completed successfully",
+			"check_name", req.Check.Name,
+			"resource_count", len(result.Resources),
+			"resources_path", result.ResourcesPath,
+		)
 	}
 
 	result.EndedAt = time.Now().UTC()
@@ -559,6 +624,7 @@ func (e *DefaultPolicyEvaluator) Generate(
 	activities []*proto.Activity,
 	data interface{},
 ) ([]*proto.Evidence, error) {
+	e.Logger.Debug("Evaluating OPA policy against check payload", "policy_path", policyPath, "labels", labels)
 	processor := policyManager.NewPolicyProcessor(
 		e.Logger,
 		labels,
@@ -568,7 +634,13 @@ func (e *DefaultPolicyEvaluator) Generate(
 		actors,
 		activities,
 	)
-	return processor.GenerateResults(ctx, policyPath, data)
+	evidence, err := processor.GenerateResults(ctx, policyPath, data)
+	if err != nil {
+		e.Logger.Warn("OPA policy evaluation failed", "policy_path", policyPath, "error", err)
+		return evidence, err
+	}
+	e.Logger.Debug("OPA policy evaluation succeeded", "policy_path", policyPath, "evidence_count", len(evidence))
+	return evidence, nil
 }
 
 type CloudCustodianPlugin struct {
@@ -583,7 +655,7 @@ type CloudCustodianPlugin struct {
 }
 
 func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.ConfigureResponse, error) {
-	p.Logger.Info("Configuring Cloud Custodian Plugin")
+	p.Logger.Debug("Received raw plugin configuration", "config_keys", sortedKeys(req.Config))
 
 	config := &PluginConfig{}
 	if err := mapstructure.Decode(req.Config, config); err != nil {
@@ -596,23 +668,48 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 		p.Logger.Error("Error parsing config", "error", err)
 		return nil, err
 	}
+	p.Logger.Debug("Parsed plugin configuration",
+		"has_inline_policies_yaml", strings.TrimSpace(parsed.PoliciesYAML) != "",
+		"policies_path", parsed.PoliciesPath,
+		"custodian_binary", parsed.CustodianBinary,
+		"check_timeout", parsed.CheckTimeout.String(),
+		"policy_labels", parsed.PolicyLabels,
+		"debug_dump_payloads", parsed.DebugDumpPayloads,
+		"debug_payload_output_dir", parsed.DebugPayloadOutputDir,
+	)
 
 	resolvedPolicies, err := resolvePoliciesYAML(context.Background(), parsed.PoliciesYAML, parsed.PoliciesPath)
 	if err != nil {
 		p.Logger.Error("Error loading cloud custodian policies", "error", err)
 		return nil, err
 	}
+	p.Logger.Debug("Resolved cloud custodian policy source", "policy_yaml_bytes", len(resolvedPolicies))
 
 	checks, err := parseCustodianChecks(resolvedPolicies)
 	if err != nil {
 		p.Logger.Error("Error parsing cloud custodian policies", "error", err)
 		return nil, err
 	}
+	parseErrorChecks := 0
+	for _, check := range checks {
+		if len(check.ParseErrors) > 0 {
+			parseErrorChecks++
+			p.Logger.Debug("Parsed check with non-fatal parse issues", "check_name", check.Name, "index", check.Index, "parse_errors", check.ParseErrors)
+		}
+	}
 
 	parsed.PoliciesYAML = string(resolvedPolicies)
 	p.config = config
 	p.parsedConfig = parsed
 	p.checks = checks
+
+	if parsed.DebugDumpPayloads {
+		if err := os.MkdirAll(parsed.DebugPayloadOutputDir, 0o755); err != nil {
+			p.Logger.Error("Failed creating debug payload output directory", "debug_payload_output_dir", parsed.DebugPayloadOutputDir, "error", err)
+			return nil, fmt.Errorf("failed creating debug payload output directory %q: %w", parsed.DebugPayloadOutputDir, err)
+		}
+		p.Logger.Debug("Debug payload dumping enabled", "debug_payload_output_dir", parsed.DebugPayloadOutputDir)
+	}
 
 	if p.executor == nil {
 		p.executor = &CommandCustodianExecutor{Logger: p.Logger.Named("custodian-executor")}
@@ -621,7 +718,7 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 		p.evaluator = &DefaultPolicyEvaluator{Logger: p.Logger.Named("policy-evaluator")}
 	}
 
-	p.Logger.Info("Cloud Custodian Plugin configured", "checks", len(checks))
+	p.Logger.Info("Cloud Custodian Plugin configured", "checks", len(checks), "checks_with_parse_errors", parseErrorChecks)
 	return &proto.ConfigureResponse{}, nil
 }
 
@@ -643,14 +740,17 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, fmt.Errorf("failed to create execution workspace: %w", err)
 	}
 	defer os.RemoveAll(executionRoot)
+	p.Logger.Debug("Created temporary execution root", "execution_root", executionRoot)
 
 	allEvidences := make([]*proto.Evidence, 0)
 	var accumulatedErrors error
 	successfulPolicyRuns := 0
 
 	for _, check := range p.checks {
+		p.Logger.Debug("Processing check", "check_name", check.Name, "check_index", check.Index, "resource", check.Resource, "provider", check.Provider)
 		execution := CustodianExecutionResult{}
 		if len(check.ParseErrors) > 0 {
+			p.Logger.Warn("Skipping custodian execution due to check parse issues", "check_name", check.Name, "parse_errors", check.ParseErrors)
 			execution = newCheckErrorExecution(check.ParseErrors)
 		} else {
 			checkDir := filepath.Join(executionRoot, fmt.Sprintf("%03d-%s", check.Index+1, sanitizeIdentifier(check.Name)))
@@ -663,19 +763,39 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 		}
 
 		payload := buildCheckPayload(check, execution)
+		p.Logger.Debug("Built standardized check payload",
+			"check_name", payload.Check.Name,
+			"status", payload.Execution.Status,
+			"matched_resource_count", payload.Result.MatchedResourceCount,
+			"execution_error_count", len(payload.Execution.Errors),
+		)
+		if p.parsedConfig.DebugDumpPayloads {
+			if err := p.dumpStandardizedPayload(payload); err != nil {
+				p.Logger.Warn("Failed writing debug standardized payload", "check_name", payload.Check.Name, "error", err)
+			}
+		}
 		evidences, evalErr, successfulRuns := p.evaluateCheckPolicies(ctx, payload, req.GetPolicyPaths())
 		allEvidences = append(allEvidences, evidences...)
 		successfulPolicyRuns += successfulRuns
+		p.Logger.Debug("Completed policy evaluations for check",
+			"check_name", payload.Check.Name,
+			"successful_policy_runs", successfulRuns,
+			"produced_evidence_count", len(evidences),
+			"had_eval_error", evalErr != nil,
+		)
 		if evalErr != nil {
 			accumulatedErrors = errors.Join(accumulatedErrors, evalErr)
 		}
 	}
 
 	if len(allEvidences) > 0 {
+		p.Logger.Debug("Submitting evidence batch via ApiHelper", "evidence_count", len(allEvidences))
 		if err := apiHelper.CreateEvidence(ctx, allEvidences); err != nil {
 			p.Logger.Error("Error creating evidence", "error", err)
 			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
 		}
+	} else {
+		p.Logger.Warn("No evidence generated by current evaluation run")
 	}
 
 	if successfulPolicyRuns == 0 && len(allEvidences) == 0 {
@@ -697,6 +817,11 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 	payload *StandardizedCheckPayload,
 	policyPaths []string,
 ) ([]*proto.Evidence, error, int) {
+	p.Logger.Debug("Evaluating policy paths for check",
+		"check_name", payload.Check.Name,
+		"check_status", payload.Execution.Status,
+		"policy_paths_count", len(policyPaths),
+	)
 	labels := map[string]string{}
 	maps.Copy(labels, p.parsedConfig.PolicyLabels)
 	labels["provider"] = sourceCloudCustodian
@@ -799,6 +924,7 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 	successfulRuns := 0
 
 	for _, policyPath := range policyPaths {
+		p.Logger.Trace("Running policy path for check", "check_name", payload.Check.Name, "policy_path", policyPath)
 		evidences, err := p.evaluator.Generate(
 			ctx,
 			policyPath,
@@ -812,13 +938,60 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 		)
 		allEvidences = append(allEvidences, evidences...)
 		if err != nil {
+			p.Logger.Warn("Policy path evaluation failed for check",
+				"check_name", payload.Check.Name,
+				"policy_path", policyPath,
+				"error", err,
+			)
 			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("policy %s failed for check %s: %w", policyPath, payload.Check.Name, err))
 			continue
 		}
+		p.Logger.Trace("Policy path evaluation succeeded for check",
+			"check_name", payload.Check.Name,
+			"policy_path", policyPath,
+			"evidence_count", len(evidences),
+		)
 		successfulRuns++
 	}
 
+	p.Logger.Debug("Completed policy path loop for check",
+		"check_name", payload.Check.Name,
+		"successful_runs", successfulRuns,
+		"evidence_count", len(allEvidences),
+		"had_errors", accumulatedErrors != nil,
+	)
 	return allEvidences, accumulatedErrors, successfulRuns
+}
+
+func (p *CloudCustodianPlugin) dumpStandardizedPayload(payload *StandardizedCheckPayload) error {
+	if payload == nil {
+		return errors.New("payload is nil")
+	}
+	if p.parsedConfig == nil || !p.parsedConfig.DebugDumpPayloads {
+		return nil
+	}
+
+	content, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	fileName := fmt.Sprintf("%03d-%s-%d.json",
+		payload.Check.Index+1,
+		sanitizeIdentifier(payload.Check.Name),
+		time.Now().UTC().UnixNano(),
+	)
+	outputPath := filepath.Join(p.parsedConfig.DebugPayloadOutputDir, fileName)
+	if err := os.WriteFile(outputPath, content, 0o600); err != nil {
+		return fmt.Errorf("write payload file %s: %w", outputPath, err)
+	}
+
+	p.Logger.Debug("Wrote standardized payload debug file",
+		"check_name", payload.Check.Name,
+		"output_path", outputPath,
+		"bytes", len(content),
+	)
+	return nil
 }
 
 func newCheckErrorExecution(messages []string) CustodianExecutionResult {
@@ -873,6 +1046,15 @@ func sanitizeIdentifier(in string) string {
 		return "unknown"
 	}
 	return out
+}
+
+func sortedKeys(input map[string]string) []string {
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func main() {

@@ -90,6 +90,30 @@ func TestPluginConfigParse(t *testing.T) {
 			t.Fatalf("expected error for invalid timeout")
 		}
 	})
+
+	t.Run("reject invalid debug boolean", func(t *testing.T) {
+		_, err := (&PluginConfig{PoliciesYAML: "x", DebugDumpPayloads: "not-bool"}).Parse()
+		if err == nil {
+			t.Fatalf("expected error for invalid debug_dump_payloads")
+		}
+	})
+
+	t.Run("enable debug dump when output dir is set", func(t *testing.T) {
+		cfg := &PluginConfig{
+			PoliciesYAML:          "policies: []",
+			DebugPayloadOutputDir: "/tmp/custom-debug-dir",
+		}
+		parsed, err := cfg.Parse()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !parsed.DebugDumpPayloads {
+			t.Fatalf("expected debug dump to auto-enable when output dir is provided")
+		}
+		if parsed.DebugPayloadOutputDir != "/tmp/custom-debug-dir" {
+			t.Fatalf("unexpected debug output dir: %s", parsed.DebugPayloadOutputDir)
+		}
+	})
 }
 
 func TestResolvePoliciesYAML(t *testing.T) {
@@ -279,6 +303,9 @@ printf '[{"id":"abc"}]' > "$out/test-policy/resources.json"
 		}
 		if !strings.Contains(argsStr, "policy.yaml") {
 			t.Fatalf("expected policy.yaml argument, got: %s", argsStr)
+		}
+		if !strings.Contains(argsStr, "--region all") {
+			t.Fatalf("expected aws region fanout args, got: %s", argsStr)
 		}
 	})
 
@@ -551,5 +578,53 @@ func TestConfigureLoadsChecks(t *testing.T) {
 	}
 	if plugin.parsedConfig.PolicyLabels["environment"] != "dev" {
 		t.Fatalf("expected parsed policy label")
+	}
+}
+
+func TestDumpStandardizedPayload(t *testing.T) {
+	plugin := &CloudCustodianPlugin{
+		Logger: hclog.NewNullLogger(),
+		parsedConfig: &ParsedConfig{
+			DebugDumpPayloads:     true,
+			DebugPayloadOutputDir: t.TempDir(),
+		},
+	}
+
+	err := plugin.dumpStandardizedPayload(&StandardizedCheckPayload{
+		SchemaVersion: "v1",
+		Source:        "cloud-custodian",
+		Check: StandardizedCheckInfo{
+			Name:     "check-a",
+			Resource: "aws.s3",
+			Provider: "aws",
+			Index:    0,
+		},
+		Execution: StandardizedExecution{
+			Status: "success",
+			DryRun: true,
+		},
+		Result: StandardizedCheckResult{
+			MatchedResourceCount: 0,
+			Resources:            []interface{}{},
+		},
+		RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected dump error: %v", err)
+	}
+
+	files, err := os.ReadDir(plugin.parsedConfig.DebugPayloadOutputDir)
+	if err != nil {
+		t.Fatalf("failed to read debug output dir: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected one dumped payload file, got %d", len(files))
+	}
+	content, err := os.ReadFile(filepath.Join(plugin.parsedConfig.DebugPayloadOutputDir, files[0].Name()))
+	if err != nil {
+		t.Fatalf("failed to read dumped payload file: %v", err)
+	}
+	if !strings.Contains(string(content), "\"schema_version\": \"v1\"") {
+		t.Fatalf("dumped payload file content does not look like standardized payload json")
 	}
 }

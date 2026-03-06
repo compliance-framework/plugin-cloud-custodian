@@ -24,6 +24,7 @@ This plugin always enforces read-only Cloud Custodian execution:
 
 - `--dryrun` is always used.
 - Mutating actions are not applied.
+- For AWS checks, the plugin runs with `--region all` to evaluate across all AWS regions by default.
 
 ## Configuration
 
@@ -36,6 +37,8 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `custodian_binary` | No | Path/name of Cloud Custodian executable. Default: `custodian`. |
 | `check_timeout_seconds` | No | Per-check timeout in seconds. Default: `300`. |
 | `policy_labels` | No | JSON map of labels merged into generated evidence labels. |
+| `debug_dump_payloads` | No | Boolean (`true`/`false`) toggle to write standardized check payload JSON files for troubleshooting. Default: `false`. |
+| `debug_payload_output_dir` | No | Directory where debug payload JSON files are written. If set, debug dumping is auto-enabled. Default when enabled without explicit path: `debug-standardized-payloads`. |
 
 Validation rules:
 
