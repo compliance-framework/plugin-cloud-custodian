@@ -289,6 +289,9 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	if err != nil {
 		result.Err = fmt.Errorf("custodian execution failed: %w", err)
 		result.Errors = append(result.Errors, result.Err.Error())
+		if result.Stderr != "" {
+			result.Errors = append(result.Errors, result.Stderr)
+		}
 	}
 	if runErr := runCtx.Err(); runErr != nil {
 		// Avoid duplicating context timeout/cancel errors when cmd.Run already
