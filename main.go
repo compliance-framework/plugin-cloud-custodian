@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +33,7 @@ import (
 const (
 	defaultCheckTimeoutSeconds  = 300
 	schemaVersionV1             = "v1"
+	schemaVersionV2             = "v2"
 	sourceCloudCustodian        = "cloud-custodian"
 	defaultRemotePolicyTimeout  = 30 * time.Second
 	defaultMaxRemotePolicyBytes = 1 << 20 // 1 MiB
@@ -40,24 +43,26 @@ var lookPath = exec.LookPath
 
 // PluginConfig receives string-only config from the agent gRPC interface.
 type PluginConfig struct {
-	PoliciesYAML          string `mapstructure:"policies_yaml"`
-	PoliciesPath          string `mapstructure:"policies_path"`
-	CustodianBinary       string `mapstructure:"custodian_binary"`
-	PolicyLabels          string `mapstructure:"policy_labels"`
-	CheckTimeoutSeconds   string `mapstructure:"check_timeout_seconds"`
-	DebugDumpPayloads     string `mapstructure:"debug_dump_payloads"`
-	DebugPayloadOutputDir string `mapstructure:"debug_payload_output_dir"`
+	PoliciesYAML           string `mapstructure:"policies_yaml"`
+	PoliciesPath           string `mapstructure:"policies_path"`
+	CustodianBinary        string `mapstructure:"custodian_binary"`
+	PolicyLabels           string `mapstructure:"policy_labels"`
+	ResourceIdentityFields string `mapstructure:"resource_identity_fields"`
+	CheckTimeoutSeconds    string `mapstructure:"check_timeout_seconds"`
+	DebugDumpPayloads      string `mapstructure:"debug_dump_payloads"`
+	DebugPayloadOutputDir  string `mapstructure:"debug_payload_output_dir"`
 }
 
 // ParsedConfig stores normalized and validated values for runtime use.
 type ParsedConfig struct {
-	PoliciesYAML          string
-	PoliciesPath          string
-	CustodianBinary       string
-	PolicyLabels          map[string]string
-	CheckTimeout          time.Duration
-	DebugDumpPayloads     bool
-	DebugPayloadOutputDir string
+	PoliciesYAML           string
+	PoliciesPath           string
+	CustodianBinary        string
+	PolicyLabels           map[string]string
+	ResourceIdentityFields map[string][]string
+	CheckTimeout           time.Duration
+	DebugDumpPayloads      bool
+	DebugPayloadOutputDir  string
 }
 
 func (c *PluginConfig) Parse() (*ParsedConfig, error) {
@@ -72,6 +77,29 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 	if strings.TrimSpace(c.PolicyLabels) != "" {
 		if err := json.Unmarshal([]byte(c.PolicyLabels), &policyLabels); err != nil {
 			return nil, fmt.Errorf("could not parse policy_labels: %w", err)
+		}
+	}
+
+	resourceIdentityFields := map[string][]string{}
+	if strings.TrimSpace(c.ResourceIdentityFields) != "" {
+		if err := json.Unmarshal([]byte(c.ResourceIdentityFields), &resourceIdentityFields); err != nil {
+			return nil, fmt.Errorf("could not parse resource_identity_fields: %w", err)
+		}
+		for resourceType, fields := range resourceIdentityFields {
+			if strings.TrimSpace(resourceType) == "" {
+				return nil, errors.New("resource_identity_fields cannot contain an empty resource type")
+			}
+			normalizedFields := make([]string, 0, len(fields))
+			for _, field := range fields {
+				field = strings.TrimSpace(field)
+				if field != "" {
+					normalizedFields = append(normalizedFields, field)
+				}
+			}
+			if len(normalizedFields) == 0 {
+				return nil, fmt.Errorf("resource_identity_fields for %q must include at least one field", resourceType)
+			}
+			resourceIdentityFields[resourceType] = normalizedFields
 		}
 	}
 
@@ -115,13 +143,14 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 	}
 
 	return &ParsedConfig{
-		PoliciesYAML:          inlineYAML,
-		PoliciesPath:          policiesPath,
-		CustodianBinary:       resolvedBinary,
-		PolicyLabels:          policyLabels,
-		CheckTimeout:          time.Duration(checkTimeoutSeconds) * time.Second,
-		DebugDumpPayloads:     debugDumpPayloads,
-		DebugPayloadOutputDir: debugPayloadOutputDir,
+		PoliciesYAML:           inlineYAML,
+		PoliciesPath:           policiesPath,
+		CustodianBinary:        resolvedBinary,
+		PolicyLabels:           policyLabels,
+		ResourceIdentityFields: resourceIdentityFields,
+		CheckTimeout:           time.Duration(checkTimeoutSeconds) * time.Second,
+		DebugDumpPayloads:      debugDumpPayloads,
+		DebugPayloadOutputDir:  debugPayloadOutputDir,
 	}, nil
 }
 
@@ -383,6 +412,54 @@ type StandardizedCheckResult struct {
 	ResourcesPath        string        `json:"resources_path,omitempty"`
 }
 
+// StandardizedResourcePayload is the per-resource OPA input contract.
+type StandardizedResourcePayload struct {
+	SchemaVersion string                   `json:"schema_version"`
+	Source        string                   `json:"source"`
+	Check         StandardizedCheckInfo    `json:"check"`
+	Resource      StandardizedResourceInfo `json:"resource"`
+	Assessment    StandardizedAssessment   `json:"assessment"`
+	Execution     StandardizedExecution    `json:"execution"`
+	RawPolicy     map[string]interface{}   `json:"raw_policy"`
+}
+
+type StandardizedResourceInfo struct {
+	ID             string            `json:"id"`
+	Type           string            `json:"type"`
+	Provider       string            `json:"provider"`
+	AccountID      string            `json:"account_id,omitempty"`
+	Region         string            `json:"region,omitempty"`
+	IdentityFields map[string]string `json:"identity_fields,omitempty"`
+	Data           interface{}       `json:"data"`
+}
+
+type StandardizedAssessment struct {
+	Status               string `json:"status"`
+	Matched              bool   `json:"matched"`
+	InventoryStatus      string `json:"inventory_status"`
+	MatchedResourceCount int    `json:"matched_resource_count"`
+	ArtifactPath         string `json:"artifact_path,omitempty"`
+	ResourcesPath        string `json:"resources_path,omitempty"`
+}
+
+type ResourceRecord struct {
+	ID             string
+	Type           string
+	Provider       string
+	AccountID      string
+	Region         string
+	IdentityFields map[string]string
+	Data           interface{}
+}
+
+type InventoryBaseline struct {
+	Execution    CustodianExecutionResult
+	Resources    map[string]ResourceRecord
+	ResourceType string
+	Provider     string
+	Err          error
+}
+
 func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult) *StandardizedCheckPayload {
 	status := "success"
 	if execution.Error != "" {
@@ -439,6 +516,237 @@ func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult)
 			ResourcesPath:        execution.ResourcesPath,
 		},
 		RawPolicy: check.RawPolicy,
+	}
+}
+
+func buildResourcePayload(
+	check CustodianCheck,
+	execution CustodianExecutionResult,
+	record ResourceRecord,
+	assessment StandardizedAssessment,
+) *StandardizedResourcePayload {
+	metadata := buildCheckMetadata(check)
+	return &StandardizedResourcePayload{
+		SchemaVersion: schemaVersionV2,
+		Source:        sourceCloudCustodian,
+		Check: StandardizedCheckInfo{
+			Name:     check.Name,
+			Resource: check.Resource,
+			Provider: check.Provider,
+			Index:    check.Index,
+			Metadata: metadata,
+		},
+		Resource: StandardizedResourceInfo{
+			ID:             record.ID,
+			Type:           record.Type,
+			Provider:       record.Provider,
+			AccountID:      record.AccountID,
+			Region:         record.Region,
+			IdentityFields: record.IdentityFields,
+			Data:           record.Data,
+		},
+		Assessment: assessment,
+		Execution:  buildExecutionInfo(execution),
+		RawPolicy:  check.RawPolicy,
+	}
+}
+
+func buildCheckMetadata(check CustodianCheck) map[string]interface{} {
+	var metadata map[string]interface{}
+	for k, v := range check.RawPolicy {
+		if k == "name" || k == "resource" {
+			continue
+		}
+		if metadata == nil {
+			metadata = map[string]interface{}{}
+		}
+		metadata[k] = v
+	}
+	return metadata
+}
+
+func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecution {
+	status := "success"
+	if execution.Error != "" {
+		status = "error"
+	}
+
+	durationMS := int64(execution.EndedAt.Sub(execution.StartedAt) / time.Millisecond)
+	if durationMS < 0 {
+		durationMS = 0
+	}
+
+	var executionErrors []string
+	if len(execution.Errors) > 0 {
+		executionErrors = append([]string{}, execution.Errors...)
+	}
+
+	return StandardizedExecution{
+		Status:     status,
+		DryRun:     true,
+		ExitCode:   execution.ExitCode,
+		StartedAt:  execution.StartedAt.UTC().Format(time.RFC3339Nano),
+		EndedAt:    execution.EndedAt.UTC().Format(time.RFC3339Nano),
+		DurationMS: durationMS,
+		Stdout:     execution.Stdout,
+		Stderr:     execution.Stderr,
+		Error:      execution.Error,
+		Errors:     executionErrors,
+	}
+}
+
+func (p *CloudCustodianPlugin) buildResourceRecord(resourceType string, resource interface{}) ResourceRecord {
+	provider := extractProvider(resourceType)
+	identityFields := map[string]string{}
+	fieldPaths := p.identityFieldPaths(resourceType)
+
+	resourceID := ""
+	for _, fieldPath := range fieldPaths {
+		value, ok := resourceStringAtPath(resource, fieldPath)
+		if !ok || value == "" {
+			continue
+		}
+		identityFields[fieldPath] = value
+		if resourceID == "" {
+			resourceID = value
+		}
+	}
+	if resourceID == "" {
+		resourceID = hashResource(resource)
+		identityFields["resource_hash"] = resourceID
+	}
+
+	record := ResourceRecord{
+		ID:             resourceID,
+		Type:           resourceType,
+		Provider:       provider,
+		IdentityFields: identityFields,
+		Data:           resource,
+	}
+	if accountID, ok := firstResourceString(resource, []string{"AccountId", "AccountID", "account_id", "accountId", "OwnerId", "OwnerID", "owner_id", "c7n:account-id"}); ok {
+		record.AccountID = accountID
+	}
+	if region, ok := firstResourceString(resource, []string{"Region", "region", "AwsRegion", "aws_region", "awsRegion", "c7n:region"}); ok {
+		record.Region = region
+	}
+	return record
+}
+
+func (p *CloudCustodianPlugin) identityFieldPaths(resourceType string) []string {
+	paths := make([]string, 0)
+	if p.parsedConfig != nil {
+		if configured, ok := p.parsedConfig.ResourceIdentityFields[resourceType]; ok {
+			paths = append(paths, configured...)
+		}
+	}
+	paths = append(paths,
+		"Arn",
+		"ARN",
+		"arn",
+		"Id",
+		"ID",
+		"id",
+		"InstanceId",
+		"instance_id",
+		"InstanceID",
+		"ResourceId",
+		"resource_id",
+		"Name",
+		"name",
+	)
+	return compactUniqueStrings(paths)
+}
+
+func compactUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func firstResourceString(resource interface{}, fieldPaths []string) (string, bool) {
+	for _, fieldPath := range fieldPaths {
+		value, ok := resourceStringAtPath(resource, fieldPath)
+		if ok && value != "" {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func resourceStringAtPath(resource interface{}, fieldPath string) (string, bool) {
+	current := resource
+	for _, part := range strings.Split(fieldPath, ".") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return "", false
+		}
+		switch typed := current.(type) {
+		case map[string]interface{}:
+			value, ok := typed[part]
+			if !ok {
+				return "", false
+			}
+			current = value
+		case map[interface{}]interface{}:
+			value, ok := typed[part]
+			if !ok {
+				return "", false
+			}
+			current = value
+		default:
+			return "", false
+		}
+	}
+
+	switch value := current.(type) {
+	case string:
+		return strings.TrimSpace(value), strings.TrimSpace(value) != ""
+	case json.Number:
+		return value.String(), value.String() != ""
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64), true
+	case float32:
+		return strconv.FormatFloat(float64(value), 'f', -1, 32), true
+	case int:
+		return strconv.Itoa(value), true
+	case int64:
+		return strconv.FormatInt(value, 10), true
+	case bool:
+		return strconv.FormatBool(value), true
+	default:
+		return "", false
+	}
+}
+
+func hashResource(resource interface{}) string {
+	content, err := json.Marshal(resource)
+	if err != nil {
+		content = []byte(fmt.Sprintf("%#v", resource))
+	}
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func buildInventoryCheck(resourceType string) CustodianCheck {
+	provider := extractProvider(resourceType)
+	name := fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType))
+	return CustodianCheck{
+		Index:    -1,
+		Name:     name,
+		Resource: resourceType,
+		Provider: provider,
+		RawPolicy: map[string]interface{}{
+			"name":     name,
+			"resource": resourceType,
+		},
 	}
 }
 
@@ -753,6 +1061,66 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 	return &proto.ConfigureResponse{}, nil
 }
 
+func (p *CloudCustodianPlugin) Init(req *proto.InitRequest, apiHelper runner.ApiHelper) (*proto.InitResponse, error) {
+	if p.parsedConfig == nil {
+		return nil, errors.New("plugin not configured")
+	}
+	return runner.InitWithSubjectsAndRisksFromPolicies(
+		context.Background(),
+		p.Logger,
+		req,
+		apiHelper,
+		p.buildSubjectTemplates(),
+	)
+}
+
+func (p *CloudCustodianPlugin) buildSubjectTemplates() []*proto.SubjectTemplate {
+	resourceTypes := p.uniqueResourceTypes()
+	templates := make([]*proto.SubjectTemplate, 0, len(resourceTypes))
+	for _, resourceType := range resourceTypes {
+		provider := extractProvider(resourceType)
+		templates = append(templates, &proto.SubjectTemplate{
+			Name:                fmt.Sprintf("cloud-custodian-%s", sanitizeIdentifier(resourceType)),
+			Type:                proto.SubjectType_SUBJECT_TYPE_RESOURCE,
+			TitleTemplate:       "Cloud Resource: {{ .resource_type }} {{ .resource_id }}",
+			DescriptionTemplate: "Cloud Custodian resource {{ .resource_id }} of type {{ .resource_type }} from provider {{ .provider }}",
+			PurposeTemplate:     "Represents a cloud resource collected by Cloud Custodian for compliance evaluation.",
+			IdentityLabelKeys:   []string{"provider", "resource_type", "resource_id"},
+			Props: []*proto.SubjectProp{
+				{Name: "provider", Value: provider},
+				{Name: "resource_type", Value: resourceType},
+			},
+			SelectorLabels: []*proto.SubjectLabelSelector{
+				{Key: "source", Value: sourceCloudCustodian},
+				{Key: "resource_type", Value: resourceType},
+			},
+			LabelSchema: []*proto.SubjectLabelSchema{
+				{Key: "provider", Description: "Cloud provider derived from the Cloud Custodian resource type."},
+				{Key: "resource_type", Description: "Cloud Custodian resource type such as aws.ec2 or aws.s3."},
+				{Key: "resource_id", Description: "Stable resource identifier extracted from the resource data."},
+				{Key: "account_id", Description: "Cloud account identifier when available in the resource data."},
+				{Key: "region", Description: "Cloud region when available in the resource data."},
+			},
+		})
+	}
+	return templates
+}
+
+func (p *CloudCustodianPlugin) uniqueResourceTypes() []string {
+	seen := map[string]bool{}
+	resourceTypes := make([]string, 0)
+	for _, check := range p.checks {
+		resourceType := strings.TrimSpace(check.Resource)
+		if resourceType == "" || resourceType == "unknown" || len(check.ParseErrors) > 0 || seen[resourceType] {
+			continue
+		}
+		seen[resourceType] = true
+		resourceTypes = append(resourceTypes, resourceType)
+	}
+	slices.Sort(resourceTypes)
+	return resourceTypes
+}
+
 func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.ApiHelper) (*proto.EvalResponse, error) {
 	ctx := context.Background()
 
@@ -777,45 +1145,82 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	var accumulatedErrors error
 	successfulPolicyRuns := 0
 
+	baselines := p.collectInventoryBaselines(ctx, executionRoot)
 	for _, check := range p.checks {
 		p.Logger.Debug("Processing check", "check_name", check.Name, "check_index", check.Index, "resource", check.Resource, "provider", check.Provider)
-		execution := CustodianExecutionResult{}
 		if len(check.ParseErrors) > 0 {
 			p.Logger.Warn("Skipping custodian execution due to check parse issues", "check_name", check.Name, "parse_errors", check.ParseErrors)
-			execution = newCheckErrorExecution(check.ParseErrors)
-		} else {
-			checkDir := filepath.Join(executionRoot, fmt.Sprintf("%03d-%s", check.Index+1, sanitizeIdentifier(check.Name)))
-			execution = p.executor.Execute(ctx, CustodianExecutionRequest{
-				BinaryPath: p.parsedConfig.CustodianBinary,
-				Check:      check,
-				Timeout:    p.parsedConfig.CheckTimeout,
-				OutputDir:  checkDir,
-			})
+			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("check %s has parse errors: %s", check.Name, strings.Join(check.ParseErrors, "; ")))
+			continue
 		}
 
-		payload := buildCheckPayload(check, execution)
-		p.Logger.Debug("Built standardized check payload",
-			"check_name", payload.Check.Name,
-			"status", payload.Execution.Status,
-			"matched_resource_count", payload.Result.MatchedResourceCount,
-			"execution_error_count", len(payload.Execution.Errors),
+		baseline := baselines[check.Resource]
+		if baseline == nil || baseline.Err != nil {
+			err := fmt.Errorf("inventory baseline unavailable for resource type %s", check.Resource)
+			if baseline != nil && baseline.Err != nil {
+				err = fmt.Errorf("%w: %v", err, baseline.Err)
+			}
+			p.Logger.Error("Skipping check due to unavailable inventory baseline", "check_name", check.Name, "resource", check.Resource, "error", err)
+			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			continue
+		}
+
+		checkDir := filepath.Join(executionRoot, fmt.Sprintf("%03d-%s", check.Index+1, sanitizeIdentifier(check.Name)))
+		execution := p.executor.Execute(ctx, CustodianExecutionRequest{
+			BinaryPath: p.parsedConfig.CustodianBinary,
+			Check:      check,
+			Timeout:    p.parsedConfig.CheckTimeout,
+			OutputDir:  checkDir,
+		})
+		if execution.Err != nil || execution.Error != "" {
+			err := fmt.Errorf("custodian policy execution failed for check %s: %s", check.Name, execution.Error)
+			p.Logger.Error("Skipping resource evaluation due to check execution error", "check_name", check.Name, "error", err)
+			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			continue
+		}
+
+		payloads := p.buildResourcePayloadsForCheck(check, execution, baseline)
+		payloadStats := summarizePayloadAssessments(payloads)
+		p.Logger.Debug("Built standardized resource payloads",
+			"check_name", check.Name,
+			"payload_count", len(payloads),
+			"matched_resource_count", len(execution.Resources),
+			"baseline_resource_count", len(baseline.Resources),
+			"compliant_resource_count", payloadStats.Compliant,
+			"non_compliant_resource_count", payloadStats.NonCompliant,
+			"missing_from_baseline_count", payloadStats.MissingFromBaseline,
 		)
+		if len(baseline.Resources) == 0 && len(execution.Resources) > 0 {
+			p.Logger.Warn("No compliant resource payloads can be generated because inventory baseline is empty while policy returned matched resources",
+				"check_name", check.Name,
+				"resource", check.Resource,
+				"matched_resource_count", len(execution.Resources),
+				"resources_path", execution.ResourcesPath,
+			)
+		}
 		if p.parsedConfig.DebugDumpPayloads {
-			if err := p.dumpStandardizedPayload(payload); err != nil {
-				p.Logger.Warn("Failed writing debug standardized payload", "check_name", payload.Check.Name, "error", err)
+			for _, payload := range payloads {
+				if err := p.dumpStandardizedPayload(payload); err != nil {
+					p.Logger.Warn("Failed writing debug standardized payload", "check_name", payload.Check.Name, "resource_id", payload.Resource.ID, "error", err)
+				}
 			}
 		}
-		evidences, evalErr, successfulRuns := p.evaluateCheckPolicies(ctx, payload, req.GetPolicyPaths())
-		allEvidences = append(allEvidences, evidences...)
-		successfulPolicyRuns += successfulRuns
-		p.Logger.Debug("Completed policy evaluations for check",
-			"check_name", payload.Check.Name,
-			"successful_policy_runs", successfulRuns,
-			"produced_evidence_count", len(evidences),
-			"had_eval_error", evalErr != nil,
-		)
-		if evalErr != nil {
-			accumulatedErrors = errors.Join(accumulatedErrors, evalErr)
+
+		for _, payload := range payloads {
+			evidences, evalErr, successfulRuns := p.evaluateResourcePolicies(ctx, payload, req.GetPolicyPaths())
+			allEvidences = append(allEvidences, evidences...)
+			successfulPolicyRuns += successfulRuns
+			p.Logger.Debug("Completed policy evaluations for resource",
+				"check_name", payload.Check.Name,
+				"resource_id", payload.Resource.ID,
+				"assessment_status", payload.Assessment.Status,
+				"successful_policy_runs", successfulRuns,
+				"produced_evidence_count", len(evidences),
+				"had_eval_error", evalErr != nil,
+			)
+			if evalErr != nil {
+				accumulatedErrors = errors.Join(accumulatedErrors, evalErr)
+			}
 		}
 	}
 
@@ -843,31 +1248,160 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	return &proto.EvalResponse{Status: proto.ExecutionStatus_SUCCESS}, nil
 }
 
-func (p *CloudCustodianPlugin) evaluateCheckPolicies(
+func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, executionRoot string) map[string]*InventoryBaseline {
+	baselines := map[string]*InventoryBaseline{}
+	for _, resourceType := range p.uniqueResourceTypes() {
+		check := buildInventoryCheck(resourceType)
+		outputDir := filepath.Join(executionRoot, fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType)))
+		execution := p.executor.Execute(ctx, CustodianExecutionRequest{
+			BinaryPath: p.parsedConfig.CustodianBinary,
+			Check:      check,
+			Timeout:    p.parsedConfig.CheckTimeout,
+			OutputDir:  outputDir,
+		})
+
+		baseline := &InventoryBaseline{
+			Execution:    execution,
+			Resources:    map[string]ResourceRecord{},
+			ResourceType: resourceType,
+			Provider:     extractProvider(resourceType),
+			Err:          execution.Err,
+		}
+		if baseline.Err == nil && execution.Error != "" {
+			baseline.Err = errors.New(execution.Error)
+		}
+		for _, resource := range execution.Resources {
+			record := p.buildResourceRecord(resourceType, resource)
+			baseline.Resources[record.ID] = record
+		}
+		baselines[resourceType] = baseline
+		p.Logger.Debug("Collected inventory baseline",
+			"resource", resourceType,
+			"resource_count", len(baseline.Resources),
+			"raw_resource_count", len(execution.Resources),
+			"resources_path", execution.ResourcesPath,
+			"exit_code", execution.ExitCode,
+			"had_error", baseline.Err != nil,
+			"error", execution.Error,
+		)
+	}
+	return baselines
+}
+
+func (p *CloudCustodianPlugin) buildResourcePayloadsForCheck(
+	check CustodianCheck,
+	execution CustodianExecutionResult,
+	baseline *InventoryBaseline,
+) []*StandardizedResourcePayload {
+	matched := map[string]ResourceRecord{}
+	for _, resource := range execution.Resources {
+		record := p.buildResourceRecord(check.Resource, resource)
+		matched[record.ID] = record
+	}
+
+	resourceIDs := make([]string, 0, len(baseline.Resources)+len(matched))
+	seen := map[string]bool{}
+	for resourceID := range baseline.Resources {
+		resourceIDs = append(resourceIDs, resourceID)
+		seen[resourceID] = true
+	}
+	for resourceID := range matched {
+		if seen[resourceID] {
+			continue
+		}
+		resourceIDs = append(resourceIDs, resourceID)
+	}
+	slices.Sort(resourceIDs)
+
+	payloads := make([]*StandardizedResourcePayload, 0, len(resourceIDs))
+	for _, resourceID := range resourceIDs {
+		record, existsInBaseline := baseline.Resources[resourceID]
+		matchedRecord, isMatched := matched[resourceID]
+		inventoryStatus := "baseline"
+		if !existsInBaseline {
+			record = matchedRecord
+			inventoryStatus = "missing_from_baseline"
+		}
+
+		status := "compliant"
+		if isMatched {
+			status = "non_compliant"
+		}
+
+		payloads = append(payloads, buildResourcePayload(check, execution, record, StandardizedAssessment{
+			Status:               status,
+			Matched:              isMatched,
+			InventoryStatus:      inventoryStatus,
+			MatchedResourceCount: len(execution.Resources),
+			ArtifactPath:         execution.ArtifactPath,
+			ResourcesPath:        execution.ResourcesPath,
+		}))
+	}
+	return payloads
+}
+
+type PayloadAssessmentStats struct {
+	Compliant           int
+	NonCompliant        int
+	MissingFromBaseline int
+}
+
+func summarizePayloadAssessments(payloads []*StandardizedResourcePayload) PayloadAssessmentStats {
+	stats := PayloadAssessmentStats{}
+	for _, payload := range payloads {
+		if payload == nil {
+			continue
+		}
+		switch payload.Assessment.Status {
+		case "compliant":
+			stats.Compliant++
+		case "non_compliant":
+			stats.NonCompliant++
+		}
+		if payload.Assessment.InventoryStatus == "missing_from_baseline" {
+			stats.MissingFromBaseline++
+		}
+	}
+	return stats
+}
+
+func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 	ctx context.Context,
-	payload *StandardizedCheckPayload,
+	payload *StandardizedResourcePayload,
 	policyPaths []string,
 ) ([]*proto.Evidence, error, int) {
-	p.Logger.Debug("Evaluating policy paths for check",
+	p.Logger.Debug("Evaluating policy paths for resource",
 		"check_name", payload.Check.Name,
-		"check_status", payload.Execution.Status,
+		"resource_id", payload.Resource.ID,
+		"assessment_status", payload.Assessment.Status,
 		"policy_paths_count", len(policyPaths),
 	)
+	p.logPolicyPayload(payload)
 	labels := map[string]string{}
 	maps.Copy(labels, p.parsedConfig.PolicyLabels)
 	labels["source"] = sourceCloudCustodian
 	labels["tool"] = sourceCloudCustodian
 	if _, exists := labels["provider"]; !exists {
-		labels["provider"] = payload.Check.Provider
+		labels["provider"] = payload.Resource.Provider
 	}
-	labels["type"] = "check"
+	labels["type"] = "resource"
 	labels["check_name"] = payload.Check.Name
 	labels["check_resource"] = payload.Check.Resource
 	labels["check_provider"] = payload.Check.Provider
 	labels["check_status"] = payload.Execution.Status
+	labels["resource_type"] = payload.Resource.Type
+	labels["resource_id"] = payload.Resource.ID
+	labels["assessment_status"] = payload.Assessment.Status
+	if payload.Resource.AccountID != "" {
+		labels["account_id"] = payload.Resource.AccountID
+	}
+	if payload.Resource.Region != "" {
+		labels["region"] = payload.Resource.Region
+	}
 
 	checkID := fmt.Sprintf("cloud-custodian-check/%s-%d", sanitizeIdentifier(payload.Check.Name), payload.Check.Index+1)
 	providerID := fmt.Sprintf("cloud-provider/%s", sanitizeIdentifier(payload.Check.Provider))
+	resourceID := fmt.Sprintf("cloud-custodian-resource/%s/%s", payload.Resource.Type, payload.Resource.ID)
 
 	actors := []*proto.OriginActor{
 		{
@@ -926,6 +1460,7 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 	}
 
 	subjects := []*proto.Subject{
+		{Type: proto.SubjectType_SUBJECT_TYPE_RESOURCE, Identifier: resourceID},
 		{Type: proto.SubjectType_SUBJECT_TYPE_INVENTORY_ITEM, Identifier: checkID},
 		{Type: proto.SubjectType_SUBJECT_TYPE_COMPONENT, Identifier: providerID},
 	}
@@ -936,13 +1471,13 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 			Steps: []*proto.Step{
 				{Title: "Load Policy", Description: "Load one Cloud Custodian policy entry from the configured policy document."},
 				{Title: "Run Dry-Run Check", Description: "Execute Cloud Custodian using --dryrun and capture generated artifacts."},
-				{Title: "Build Standardized Payload", Description: "Convert execution output and matched resources into standardized OPA input."},
+				{Title: "Build Resource Payload", Description: "Compare policy matches with inventory baseline and build one standardized OPA input for this resource."},
 			},
 		},
 		{
 			Title: "Evaluate OPA Policy Bundles",
 			Steps: []*proto.Step{
-				{Title: "Evaluate Check Payload", Description: "Run policy bundles against the standardized Cloud Custodian check payload."},
+				{Title: "Evaluate Resource Payload", Description: "Run policy bundles against the standardized Cloud Custodian resource payload."},
 			},
 		},
 	}
@@ -952,7 +1487,7 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 	successfulRuns := 0
 
 	for _, policyPath := range policyPaths {
-		p.Logger.Trace("Running policy path for check", "check_name", payload.Check.Name, "policy_path", policyPath)
+		p.Logger.Trace("Running policy path for resource", "check_name", payload.Check.Name, "resource_id", payload.Resource.ID, "policy_path", policyPath)
 		evidences, err := p.evaluator.Generate(
 			ctx,
 			policyPath,
@@ -966,24 +1501,27 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 		)
 		allEvidences = append(allEvidences, evidences...)
 		if err != nil {
-			p.Logger.Warn("Policy path evaluation failed for check",
+			p.Logger.Warn("Policy path evaluation failed for resource",
 				"check_name", payload.Check.Name,
+				"resource_id", payload.Resource.ID,
 				"policy_path", policyPath,
 				"error", err,
 			)
-			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("policy %s failed for check %s: %w", policyPath, payload.Check.Name, err))
+			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("policy %s failed for check %s resource %s: %w", policyPath, payload.Check.Name, payload.Resource.ID, err))
 			continue
 		}
-		p.Logger.Trace("Policy path evaluation succeeded for check",
+		p.Logger.Trace("Policy path evaluation succeeded for resource",
 			"check_name", payload.Check.Name,
+			"resource_id", payload.Resource.ID,
 			"policy_path", policyPath,
 			"evidence_count", len(evidences),
 		)
 		successfulRuns++
 	}
 
-	p.Logger.Debug("Completed policy path loop for check",
+	p.Logger.Debug("Completed policy path loop for resource",
 		"check_name", payload.Check.Name,
+		"resource_id", payload.Resource.ID,
 		"successful_runs", successfulRuns,
 		"evidence_count", len(allEvidences),
 		"had_errors", accumulatedErrors != nil,
@@ -991,7 +1529,28 @@ func (p *CloudCustodianPlugin) evaluateCheckPolicies(
 	return allEvidences, accumulatedErrors, successfulRuns
 }
 
-func (p *CloudCustodianPlugin) dumpStandardizedPayload(payload *StandardizedCheckPayload) error {
+func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePayload) {
+	if payload == nil || !p.Logger.IsDebug() {
+		return
+	}
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		p.Logger.Debug("Policy payload serialization failed",
+			"check_name", payload.Check.Name,
+			"resource_id", payload.Resource.ID,
+			"error", err,
+		)
+		return
+	}
+	p.Logger.Debug("Policy payload",
+		"check_name", payload.Check.Name,
+		"resource_id", payload.Resource.ID,
+		"assessment_status", payload.Assessment.Status,
+		"data", string(raw),
+	)
+}
+
+func (p *CloudCustodianPlugin) dumpStandardizedPayload(payload *StandardizedResourcePayload) error {
 	if payload == nil {
 		return errors.New("payload is nil")
 	}
@@ -1006,7 +1565,7 @@ func (p *CloudCustodianPlugin) dumpStandardizedPayload(payload *StandardizedChec
 
 	fileName := fmt.Sprintf("%03d-%s-%d.json",
 		payload.Check.Index+1,
-		sanitizeIdentifier(payload.Check.Name),
+		fmt.Sprintf("%s-%s", sanitizeIdentifier(payload.Check.Name), sanitizeIdentifier(payload.Resource.ID)),
 		time.Now().UTC().UnixNano(),
 	)
 	outputPath := filepath.Join(p.parsedConfig.DebugPayloadOutputDir, fileName)
@@ -1016,6 +1575,7 @@ func (p *CloudCustodianPlugin) dumpStandardizedPayload(payload *StandardizedChec
 
 	p.Logger.Debug("Wrote standardized payload debug file",
 		"check_name", payload.Check.Name,
+		"resource_id", payload.Resource.ID,
 		"output_path", outputPath,
 		"bytes", len(content),
 	)
@@ -1097,7 +1657,7 @@ func main() {
 	goplugin.Serve(&goplugin.ServeConfig{
 		HandshakeConfig: runner.HandshakeConfig,
 		Plugins: map[string]goplugin.Plugin{
-			"runner": &runner.RunnerGRPCPlugin{Impl: plugin},
+			"runner": &runner.RunnerV2GRPCPlugin{Impl: plugin},
 		},
 		GRPCServer: goplugin.DefaultGRPCServer,
 	})

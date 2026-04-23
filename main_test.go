@@ -485,12 +485,12 @@ func (f *fakePolicyEvaluator) Generate(
 	activities []*proto.Activity,
 	data interface{},
 ) ([]*proto.Evidence, error) {
-	payload, ok := data.(*StandardizedCheckPayload)
+	payload, ok := data.(*StandardizedResourcePayload)
 	if !ok {
 		return nil, errors.New("unexpected payload type")
 	}
 
-	f.calls = append(f.calls, fmt.Sprintf("%s|%s|%s", payload.Check.Name, policyPath, payload.Execution.Status))
+	f.calls = append(f.calls, fmt.Sprintf("%s|%s|%s|%s", payload.Check.Name, payload.Resource.ID, policyPath, payload.Assessment.Status))
 	copiedLabels := map[string]string{}
 	for k, v := range labels {
 		copiedLabels[k] = v
@@ -500,13 +500,16 @@ func (f *fakePolicyEvaluator) Generate(
 		return nil, errors.New("forced evaluator error")
 	}
 
-	return []*proto.Evidence{{UUID: fmt.Sprintf("%s-%s", payload.Check.Name, policyPath), Labels: labels}}, nil
+	return []*proto.Evidence{{UUID: fmt.Sprintf("%s-%s-%s", payload.Check.Name, payload.Resource.ID, policyPath), Labels: labels}}, nil
 }
 
 type fakeAPIHelper struct {
-	calls    int
-	evidence []*proto.Evidence
-	err      error
+	calls                int
+	evidence             []*proto.Evidence
+	err                  error
+	subjectTemplates     []*proto.SubjectTemplate
+	riskTemplateCalls    int
+	riskTemplatePackages []string
 }
 
 func (f *fakeAPIHelper) CreateEvidence(ctx context.Context, evidence []*proto.Evidence) error {
@@ -515,11 +518,37 @@ func (f *fakeAPIHelper) CreateEvidence(ctx context.Context, evidence []*proto.Ev
 	return f.err
 }
 
+func (f *fakeAPIHelper) UpsertRiskTemplates(ctx context.Context, packageName string, riskTemplates []*proto.RiskTemplate) error {
+	f.riskTemplateCalls++
+	f.riskTemplatePackages = append(f.riskTemplatePackages, packageName)
+	return nil
+}
+
+func (f *fakeAPIHelper) UpsertSubjectTemplates(ctx context.Context, subjectTemplates []*proto.SubjectTemplate) error {
+	f.subjectTemplates = append(f.subjectTemplates, subjectTemplates...)
+	return nil
+}
+
 func TestEvalLoopBehavior(t *testing.T) {
 	now := time.Now().UTC()
 
 	t.Run("continues on check execution errors and submits evidence", func(t *testing.T) {
 		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{
+					map[string]interface{}{"id": "1"},
+					map[string]interface{}{"id": "2"},
+				},
+			},
+			"inventory-aws-ec2": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{map[string]interface{}{"id": "ec2-1"}},
+			},
 			"check-a": {
 				StartedAt: now,
 				EndedAt:   now.Add(20 * time.Millisecond),
@@ -560,8 +589,8 @@ func TestEvalLoopBehavior(t *testing.T) {
 		if resp.GetStatus() != proto.ExecutionStatus_SUCCESS {
 			t.Fatalf("expected success status, got %s", resp.GetStatus().String())
 		}
-		if len(executor.calls) != 2 {
-			t.Fatalf("expected 2 executor calls, got %d", len(executor.calls))
+		if len(executor.calls) != 4 {
+			t.Fatalf("expected 4 executor calls, got %d", len(executor.calls))
 		}
 		if len(evaluator.calls) != 4 {
 			t.Fatalf("expected 4 evaluator calls, got %d", len(evaluator.calls))
@@ -573,20 +602,29 @@ func TestEvalLoopBehavior(t *testing.T) {
 			t.Fatalf("expected 4 evidences, got %d", len(apiHelper.evidence))
 		}
 
-		hasErrorStatusPayload := false
+		hasCompliantPayload := false
+		hasNonCompliantPayload := false
 		for _, call := range evaluator.calls {
-			if strings.Contains(call, "check-b|") && strings.HasSuffix(call, "|error") {
-				hasErrorStatusPayload = true
-				break
+			if strings.Contains(call, "check-a|1|") && strings.HasSuffix(call, "|non_compliant") {
+				hasNonCompliantPayload = true
+			}
+			if strings.Contains(call, "check-a|2|") && strings.HasSuffix(call, "|compliant") {
+				hasCompliantPayload = true
 			}
 		}
-		if !hasErrorStatusPayload {
-			t.Fatalf("expected check-b payload to carry error execution status")
+		if !hasCompliantPayload || !hasNonCompliantPayload {
+			t.Fatalf("expected resource payloads to include compliant and non_compliant statuses, got %v", evaluator.calls)
 		}
 	})
 
 	t.Run("fails when all policy evaluations fail", func(t *testing.T) {
 		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now,
+				ExitCode:  0,
+				Resources: []interface{}{map[string]interface{}{"id": "1"}},
+			},
 			"check-a": {
 				StartedAt: now,
 				EndedAt:   now,
@@ -625,6 +663,12 @@ func TestEvalLoopBehavior(t *testing.T) {
 
 	t.Run("preserves user provider label and adds source labels", func(t *testing.T) {
 		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now,
+				ExitCode:  0,
+				Resources: []interface{}{map[string]interface{}{"id": "1"}},
+			},
 			"check-a": {
 				StartedAt: now,
 				EndedAt:   now,
@@ -702,6 +746,58 @@ func TestConfigureLoadsChecks(t *testing.T) {
 	}
 }
 
+func TestInitUpsertsSubjectAndRiskTemplates(t *testing.T) {
+	policyDir := t.TempDir()
+	rego := `package compliance_framework.cloud_custodian_test
+
+risk_templates := [{
+	"name": "public_bucket",
+	"title": "Public bucket",
+	"statement": "A bucket is publicly accessible.",
+	"likelihood_hint": "medium",
+	"impact_hint": "high",
+	"violation_ids": ["cloud.public_bucket"],
+}]
+`
+	if err := os.WriteFile(filepath.Join(policyDir, "risk.rego"), []byte(rego), 0o600); err != nil {
+		t.Fatalf("failed to write risk policy: %v", err)
+	}
+
+	apiHelper := &fakeAPIHelper{}
+	plugin := &CloudCustodianPlugin{
+		Logger:       hclog.NewNullLogger(),
+		parsedConfig: &ParsedConfig{},
+		checks: []CustodianCheck{
+			{Index: 0, Name: "s3-check", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "s3-check", "resource": "aws.s3"}},
+			{Index: 1, Name: "s3-check-2", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "s3-check-2", "resource": "aws.s3"}},
+			{Index: 2, Name: "ec2-check", Resource: "aws.ec2", Provider: "aws", RawPolicy: map[string]interface{}{"name": "ec2-check", "resource": "aws.ec2"}},
+		},
+	}
+
+	resp, err := plugin.Init(&proto.InitRequest{PolicyPaths: []string{policyDir}}, apiHelper)
+	if err != nil {
+		t.Fatalf("unexpected init error: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("expected init response")
+	}
+	if len(apiHelper.subjectTemplates) != 2 {
+		t.Fatalf("expected two unique subject templates, got %d", len(apiHelper.subjectTemplates))
+	}
+	if apiHelper.subjectTemplates[0].GetType() != proto.SubjectType_SUBJECT_TYPE_RESOURCE {
+		t.Fatalf("expected resource subject template type")
+	}
+	if apiHelper.subjectTemplates[0].GetIdentityLabelKeys()[0] != "provider" {
+		t.Fatalf("expected provider identity label, got %v", apiHelper.subjectTemplates[0].GetIdentityLabelKeys())
+	}
+	if apiHelper.riskTemplateCalls != 1 {
+		t.Fatalf("expected one risk template upsert, got %d", apiHelper.riskTemplateCalls)
+	}
+	if len(apiHelper.riskTemplatePackages) != 1 || apiHelper.riskTemplatePackages[0] != "compliance_framework.cloud_custodian_test" {
+		t.Fatalf("unexpected risk template packages: %v", apiHelper.riskTemplatePackages)
+	}
+}
+
 func TestDumpStandardizedPayload(t *testing.T) {
 	plugin := &CloudCustodianPlugin{
 		Logger: hclog.NewNullLogger(),
@@ -711,8 +807,8 @@ func TestDumpStandardizedPayload(t *testing.T) {
 		},
 	}
 
-	err := plugin.dumpStandardizedPayload(&StandardizedCheckPayload{
-		SchemaVersion: "v1",
+	err := plugin.dumpStandardizedPayload(&StandardizedResourcePayload{
+		SchemaVersion: "v2",
 		Source:        "cloud-custodian",
 		Check: StandardizedCheckInfo{
 			Name:     "check-a",
@@ -724,9 +820,15 @@ func TestDumpStandardizedPayload(t *testing.T) {
 			Status: "success",
 			DryRun: true,
 		},
-		Result: StandardizedCheckResult{
-			MatchedResourceCount: 0,
-			Resources:            []interface{}{},
+		Resource: StandardizedResourceInfo{
+			ID:       "resource-1",
+			Type:     "aws.s3",
+			Provider: "aws",
+			Data:     map[string]interface{}{"id": "resource-1"},
+		},
+		Assessment: StandardizedAssessment{
+			Status:          "compliant",
+			InventoryStatus: "baseline",
 		},
 		RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"},
 	})
@@ -745,7 +847,7 @@ func TestDumpStandardizedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read dumped payload file: %v", err)
 	}
-	if !strings.Contains(string(content), "\"schema_version\": \"v1\"") {
+	if !strings.Contains(string(content), "\"schema_version\": \"v2\"") {
 		t.Fatalf("dumped payload file content does not look like standardized payload json")
 	}
 }
