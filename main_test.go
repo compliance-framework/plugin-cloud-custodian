@@ -469,9 +469,10 @@ func (f *fakeExecutor) Execute(ctx context.Context, req CustodianExecutionReques
 }
 
 type fakePolicyEvaluator struct {
-	calls      []string
-	failChecks map[string]bool
-	labelsSeen []map[string]string
+	calls        []string
+	failChecks   map[string]bool
+	labelsSeen   []map[string]string
+	subjectsSeen [][]*proto.Subject
 }
 
 func (f *fakePolicyEvaluator) Generate(
@@ -496,11 +497,16 @@ func (f *fakePolicyEvaluator) Generate(
 		copiedLabels[k] = v
 	}
 	f.labelsSeen = append(f.labelsSeen, copiedLabels)
+	f.subjectsSeen = append(f.subjectsSeen, subjects)
 	if f.failChecks[payload.Check.Name] {
 		return nil, errors.New("forced evaluator error")
 	}
 
-	return []*proto.Evidence{{UUID: fmt.Sprintf("%s-%s-%s", payload.Check.Name, payload.Resource.ID, policyPath), Labels: labels}}, nil
+	evidenceLabels := map[string]string{}
+	for k, v := range labels {
+		evidenceLabels[k] = v
+	}
+	return []*proto.Evidence{{UUID: fmt.Sprintf("%s-%s-%s", payload.Check.Name, payload.Resource.ID, policyPath), Labels: evidenceLabels}}, nil
 }
 
 type fakeAPIHelper struct {
@@ -683,7 +689,14 @@ func TestEvalLoopBehavior(t *testing.T) {
 		plugin := &CloudCustodianPlugin{
 			Logger: hclog.NewNullLogger(),
 			parsedConfig: &ParsedConfig{
-				PolicyLabels: map[string]string{"provider": "custom-provider", "team": "platform"},
+				PolicyLabels: map[string]string{
+					"provider":          "custom-provider",
+					"team":              "platform",
+					"resource_id":       "must-not-leak",
+					"assessment":        "must-not-leak",
+					"assessment_status": "must-not-leak",
+					"check_provider":    "must-not-leak",
+				},
 				CheckTimeout: 30 * time.Second,
 			},
 			checks: []CustodianCheck{
@@ -714,8 +727,34 @@ func TestEvalLoopBehavior(t *testing.T) {
 		if labels["tool"] != sourceCloudCustodian {
 			t.Fatalf("expected tool label, got: %s", labels["tool"])
 		}
-		if labels["check_provider"] != "aws" {
-			t.Fatalf("expected check_provider label to be aws, got: %s", labels["check_provider"])
+		if _, ok := labels["check_provider"]; ok {
+			t.Fatalf("expected check_provider label to be removed, got labels: %v", labels)
+		}
+		if _, ok := labels["assessment_status"]; ok {
+			t.Fatalf("expected assessment_status label to be removed, got labels: %v", labels)
+		}
+		if _, ok := labels["assessment"]; ok {
+			t.Fatalf("expected assessment label to be removed, got labels: %v", labels)
+		}
+		if labels["resource_id"] != "1" {
+			t.Fatalf("expected resource_id label to be set, got: %s", labels["resource_id"])
+		}
+		if len(apiHelper.evidence) == 0 {
+			t.Fatalf("expected submitted evidence")
+		}
+		evidenceLabels := apiHelper.evidence[0].Labels
+		if evidenceLabels["resource_id"] != "1" {
+			t.Fatalf("expected submitted evidence resource_id label to be set, got: %s", evidenceLabels["resource_id"])
+		}
+		if len(evaluator.subjectsSeen) == 0 || len(evaluator.subjectsSeen[0]) == 0 {
+			t.Fatalf("expected evaluator to capture subjects")
+		}
+		resourceSubject := evaluator.subjectsSeen[0][0]
+		if len(resourceSubject.Links) != 1 || resourceSubject.Links[0].Href != "1" {
+			t.Fatalf("expected resource subject link to contain resource id, got %#v", resourceSubject.Links)
+		}
+		if len(resourceSubject.Props) != 1 || resourceSubject.Props[0].Name != "resource_id" || resourceSubject.Props[0].Value != "1" {
+			t.Fatalf("expected resource_id subject prop, got %#v", resourceSubject.Props)
 		}
 	})
 }
@@ -743,6 +782,22 @@ func TestConfigureLoadsChecks(t *testing.T) {
 	}
 	if plugin.parsedConfig.PolicyLabels["environment"] != "dev" {
 		t.Fatalf("expected parsed policy label")
+	}
+}
+
+func TestBuildResourceRecordCanonicalizesHostedZoneARN(t *testing.T) {
+	plugin := &CloudCustodianPlugin{parsedConfig: &ParsedConfig{}}
+	record := plugin.buildResourceRecord("aws.hostedzone", map[string]interface{}{
+		"Id":   "/hostedzone/Z0819711ZIJQWWE99PT",
+		"Name": "example.com.",
+	})
+
+	expected := "arn:aws:route53:::hostedzone/Z0819711ZIJQWWE99PT"
+	if record.ID != expected {
+		t.Fatalf("expected hosted zone arn %q, got %q", expected, record.ID)
+	}
+	if record.IdentityFields["arn"] != expected {
+		t.Fatalf("expected identity fields to include synthesized arn, got %#v", record.IdentityFields)
 	}
 }
 
@@ -787,8 +842,8 @@ risk_templates := [{
 	if apiHelper.subjectTemplates[0].GetType() != proto.SubjectType_SUBJECT_TYPE_RESOURCE {
 		t.Fatalf("expected resource subject template type")
 	}
-	if apiHelper.subjectTemplates[0].GetIdentityLabelKeys()[0] != "provider" {
-		t.Fatalf("expected provider identity label, got %v", apiHelper.subjectTemplates[0].GetIdentityLabelKeys())
+	if got := apiHelper.subjectTemplates[0].GetIdentityLabelKeys(); len(got) != 3 || got[2] != "resource_id" {
+		t.Fatalf("expected resource_id identity label, got %v", got)
 	}
 	if apiHelper.riskTemplateCalls != 1 {
 		t.Fatalf("expected one risk template upsert, got %d", apiHelper.riskTemplateCalls)

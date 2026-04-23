@@ -142,6 +142,12 @@ Each resource/check iteration produces one payload with this shape:
 }
 ```
 
+Generated evidence labels include `resource_id`, `resource_type`, `provider`,
+and any available `account_id`/`region`. The resource subject also includes the
+resource identifier as a link and a `resource_id` property. AWS Route53 hosted
+zone identifiers such as `/hostedzone/Z123` are normalized to full ARNs such as
+`arn:aws:route53:::hostedzone/Z123`.
+
 `assessment.inventory_status` is `baseline` for resources found in the unfiltered
 inventory run. If a policy returns a resource that is not present in the baseline,
 the plugin still evaluates it as `non_compliant` and sets

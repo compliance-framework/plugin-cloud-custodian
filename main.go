@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -615,6 +614,10 @@ func (p *CloudCustodianPlugin) buildResourceRecord(resourceType string, resource
 		resourceID = hashResource(resource)
 		identityFields["resource_hash"] = resourceID
 	}
+	resourceID = canonicalResourceID(resourceType, provider, resourceID)
+	if strings.HasPrefix(resourceID, "arn:") {
+		identityFields["arn"] = resourceID
+	}
 
 	record := ResourceRecord{
 		ID:             resourceID,
@@ -630,6 +633,23 @@ func (p *CloudCustodianPlugin) buildResourceRecord(resourceType string, resource
 		record.Region = region
 	}
 	return record
+}
+
+func canonicalResourceID(resourceType string, provider string, resourceID string) string {
+	resourceID = strings.TrimSpace(resourceID)
+	if resourceID == "" || strings.HasPrefix(resourceID, "arn:") {
+		return resourceID
+	}
+	if provider == "aws" && resourceType == "aws.hostedzone" {
+		hostedZoneID := strings.TrimPrefix(resourceID, "/")
+		if strings.HasPrefix(hostedZoneID, "hostedzone/") {
+			return "arn:aws:route53:::" + hostedZoneID
+		}
+		if strings.HasPrefix(hostedZoneID, "Z") {
+			return "arn:aws:route53:::hostedzone/" + hostedZoneID
+		}
+	}
+	return resourceID
 }
 
 func (p *CloudCustodianPlugin) identityFieldPaths(resourceType string) []string {
@@ -1062,16 +1082,49 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 }
 
 func (p *CloudCustodianPlugin) Init(req *proto.InitRequest, apiHelper runner.ApiHelper) (*proto.InitResponse, error) {
+	p.Logger.Debug("Cloud Custodian Plugin Init called",
+		"configured", p.parsedConfig != nil,
+		"policy_paths", req.GetPolicyPaths(),
+		"policy_paths_count", len(req.GetPolicyPaths()),
+		"checks_count", len(p.checks),
+	)
 	if p.parsedConfig == nil {
+		p.Logger.Error("Cloud Custodian Plugin Init failed because plugin is not configured")
 		return nil, errors.New("plugin not configured")
 	}
-	return runner.InitWithSubjectsAndRisksFromPolicies(
+
+	resourceTypes := p.uniqueResourceTypes()
+	subjectTemplates := p.buildSubjectTemplates()
+	templateNames := make([]string, 0, len(subjectTemplates))
+	for _, subjectTemplate := range subjectTemplates {
+		templateNames = append(templateNames, subjectTemplate.GetName())
+	}
+	p.Logger.Debug("Cloud Custodian Plugin Init prepared subject templates",
+		"resource_types", resourceTypes,
+		"subject_template_count", len(subjectTemplates),
+		"subject_template_names", templateNames,
+	)
+
+	p.Logger.Debug("Cloud Custodian Plugin Init delegating subject and risk template upsert",
+		"policy_paths", req.GetPolicyPaths(),
+		"subject_template_count", len(subjectTemplates),
+	)
+	resp, err := runner.InitWithSubjectsAndRisksFromPolicies(
 		context.Background(),
 		p.Logger,
 		req,
 		apiHelper,
-		p.buildSubjectTemplates(),
+		subjectTemplates,
 	)
+	if err != nil {
+		p.Logger.Error("Cloud Custodian Plugin Init failed while upserting subject or risk templates", "error", err)
+		return resp, err
+	}
+	p.Logger.Debug("Cloud Custodian Plugin Init completed",
+		"subject_template_count", len(subjectTemplates),
+		"policy_paths_count", len(req.GetPolicyPaths()),
+	)
+	return resp, nil
 }
 
 func (p *CloudCustodianPlugin) buildSubjectTemplates() []*proto.SubjectTemplate {
@@ -1080,8 +1133,9 @@ func (p *CloudCustodianPlugin) buildSubjectTemplates() []*proto.SubjectTemplate 
 	for _, resourceType := range resourceTypes {
 		provider := extractProvider(resourceType)
 		templates = append(templates, &proto.SubjectTemplate{
-			Name:                fmt.Sprintf("cloud-custodian-%s", sanitizeIdentifier(resourceType)),
-			Type:                proto.SubjectType_SUBJECT_TYPE_RESOURCE,
+			Name: fmt.Sprintf("cloud-custodian-%s", sanitizeIdentifier(resourceType)),
+			// So that automation renders component definitions
+			Type:                proto.SubjectType_SUBJECT_TYPE_COMPONENT,
 			TitleTemplate:       "Cloud Resource: {{ .resource_type }} {{ .resource_id }}",
 			DescriptionTemplate: "Cloud Custodian resource {{ .resource_id }} of type {{ .resource_type }} from provider {{ .provider }}",
 			PurposeTemplate:     "Represents a cloud resource collected by Cloud Custodian for compliance evaluation.",
@@ -1377,8 +1431,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 		"policy_paths_count", len(policyPaths),
 	)
 	p.logPolicyPayload(payload)
-	labels := map[string]string{}
-	maps.Copy(labels, p.parsedConfig.PolicyLabels)
+	labels := resourcePolicyLabels(p.parsedConfig.PolicyLabels)
 	labels["source"] = sourceCloudCustodian
 	labels["tool"] = sourceCloudCustodian
 	if _, exists := labels["provider"]; !exists {
@@ -1387,11 +1440,9 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 	labels["type"] = "resource"
 	labels["check_name"] = payload.Check.Name
 	labels["check_resource"] = payload.Check.Resource
-	labels["check_provider"] = payload.Check.Provider
 	labels["check_status"] = payload.Execution.Status
 	labels["resource_type"] = payload.Resource.Type
 	labels["resource_id"] = payload.Resource.ID
-	labels["assessment_status"] = payload.Assessment.Status
 	if payload.Resource.AccountID != "" {
 		labels["account_id"] = payload.Resource.AccountID
 	}
@@ -1460,7 +1511,20 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 	}
 
 	subjects := []*proto.Subject{
-		{Type: proto.SubjectType_SUBJECT_TYPE_RESOURCE, Identifier: resourceID},
+		{
+			Type:       proto.SubjectType_SUBJECT_TYPE_RESOURCE,
+			Identifier: resourceID,
+			Links: []*proto.Link{
+				{
+					Href: payload.Resource.ID,
+					Rel:  policyManager.Pointer("related"),
+					Text: policyManager.Pointer("Cloud resource identifier"),
+				},
+			},
+			Props: []*proto.Property{
+				{Name: "resource_id", Value: payload.Resource.ID},
+			},
+		},
 		{Type: proto.SubjectType_SUBJECT_TYPE_INVENTORY_ITEM, Identifier: checkID},
 		{Type: proto.SubjectType_SUBJECT_TYPE_COMPONENT, Identifier: providerID},
 	}
@@ -1527,6 +1591,26 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 		"had_errors", accumulatedErrors != nil,
 	)
 	return allEvidences, accumulatedErrors, successfulRuns
+}
+
+func resourcePolicyLabels(policyLabels map[string]string) map[string]string {
+	labels := map[string]string{}
+	for key, value := range policyLabels {
+		if isReservedResourceLabel(key) {
+			continue
+		}
+		labels[key] = value
+	}
+	return labels
+}
+
+func isReservedResourceLabel(label string) bool {
+	switch label {
+	case "assessment", "assessment_status", "check_provider":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePayload) {
