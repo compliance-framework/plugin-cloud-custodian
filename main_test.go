@@ -791,6 +791,10 @@ func TestEvalLoopBehavior(t *testing.T) {
 			t.Fatalf("expected evaluator to capture subjects")
 		}
 		resourceSubject := evaluator.subjectsSeen[0][0]
+		expectedResourceSubjectID := "cloud-custodian-resource/aws.s3/1"
+		if resourceSubject.Identifier != expectedResourceSubjectID {
+			t.Fatalf("expected escaped resource subject identifier %q, got %q", expectedResourceSubjectID, resourceSubject.Identifier)
+		}
 		if len(resourceSubject.Links) != 1 || resourceSubject.Links[0].Href != "1" {
 			t.Fatalf("expected resource subject link to contain resource id, got %#v", resourceSubject.Links)
 		}

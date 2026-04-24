@@ -1418,7 +1418,11 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 
 	checkID := fmt.Sprintf("cloud-custodian-check/%s-%d", sanitizeIdentifier(payload.Check.Name), payload.Check.Index+1)
 	providerID := fmt.Sprintf("cloud-provider/%s", sanitizeIdentifier(payload.Check.Provider))
-	resourceID := fmt.Sprintf("cloud-custodian-resource/%s/%s", payload.Resource.Type, payload.Resource.ID)
+	resourceID := fmt.Sprintf(
+		"cloud-custodian-resource/%s/%s",
+		url.PathEscape(payload.Resource.Type),
+		url.PathEscape(payload.Resource.ID),
+	)
 
 	actors := []*proto.OriginActor{
 		{
