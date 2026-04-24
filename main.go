@@ -463,32 +463,6 @@ type InventoryBaseline struct {
 }
 
 func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult) *StandardizedCheckPayload {
-	status := "success"
-	if execution.Error != "" {
-		status = "error"
-	}
-
-	durationMS := int64(execution.EndedAt.Sub(execution.StartedAt) / time.Millisecond)
-	if durationMS < 0 {
-		durationMS = 0
-	}
-
-	var metadata map[string]interface{}
-	for k, v := range check.RawPolicy {
-		if k == "name" || k == "resource" {
-			continue
-		}
-		if metadata == nil {
-			metadata = map[string]interface{}{}
-		}
-		metadata[k] = v
-	}
-
-	var executionErrors []string
-	if len(execution.Errors) > 0 {
-		executionErrors = append([]string{}, execution.Errors...)
-	}
-
 	return &StandardizedCheckPayload{
 		SchemaVersion: schemaVersionV1,
 		Source:        sourceCloudCustodian,
@@ -497,20 +471,9 @@ func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult)
 			Resource: check.Resource,
 			Provider: check.Provider,
 			Index:    check.Index,
-			Metadata: metadata,
+			Metadata: buildCheckMetadata(check),
 		},
-		Execution: StandardizedExecution{
-			Status:     status,
-			DryRun:     true,
-			ExitCode:   execution.ExitCode,
-			StartedAt:  execution.StartedAt.UTC().Format(time.RFC3339Nano),
-			EndedAt:    execution.EndedAt.UTC().Format(time.RFC3339Nano),
-			DurationMS: durationMS,
-			Stdout:     execution.Stdout,
-			Stderr:     execution.Stderr,
-			Error:      execution.Error,
-			Errors:     executionErrors,
-		},
+		Execution: buildExecutionInfo(execution),
 		Result: StandardizedCheckResult{
 			MatchedResourceCount: len(execution.Resources),
 			Resources:            execution.Resources,

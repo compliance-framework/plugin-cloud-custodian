@@ -85,6 +85,47 @@ func TestPluginConfigParse(t *testing.T) {
 		}
 	})
 
+	t.Run("parse resource identity fields", func(t *testing.T) {
+		parsed, err := (&PluginConfig{
+			PoliciesYAML:           "x",
+			ResourceIdentityFields: `{"aws.ec2":[" InstanceId ","Arn",""]}`,
+		}).Parse()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := parsed.ResourceIdentityFields["aws.ec2"]
+		if len(got) != 2 || got[0] != "InstanceId" || got[1] != "Arn" {
+			t.Fatalf("unexpected normalized resource identity fields: %#v", got)
+		}
+	})
+
+	t.Run("reject invalid resource identity fields json", func(t *testing.T) {
+		_, err := (&PluginConfig{PoliciesYAML: "x", ResourceIdentityFields: "{"}).Parse()
+		if err == nil {
+			t.Fatalf("expected error for invalid resource_identity_fields json")
+		}
+	})
+
+	t.Run("reject empty resource type in resource identity fields", func(t *testing.T) {
+		_, err := (&PluginConfig{
+			PoliciesYAML:           "x",
+			ResourceIdentityFields: `{"":["Id"]}`,
+		}).Parse()
+		if err == nil {
+			t.Fatalf("expected error for empty resource type key")
+		}
+	})
+
+	t.Run("reject empty resource identity field list", func(t *testing.T) {
+		_, err := (&PluginConfig{
+			PoliciesYAML:           "x",
+			ResourceIdentityFields: `{"aws.ec2":[" ",""]}`,
+		}).Parse()
+		if err == nil {
+			t.Fatalf("expected error for empty resource identity field list")
+		}
+	})
+
 	t.Run("reject invalid timeout", func(t *testing.T) {
 		_, err := (&PluginConfig{PoliciesYAML: "x", CheckTimeoutSeconds: "abc"}).Parse()
 		if err == nil {
@@ -798,6 +839,105 @@ func TestBuildResourceRecordCanonicalizesHostedZoneARN(t *testing.T) {
 	}
 	if record.IdentityFields["arn"] != expected {
 		t.Fatalf("expected identity fields to include synthesized arn, got %#v", record.IdentityFields)
+	}
+}
+
+func TestResourceStringAtPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource interface{}
+		path     string
+		want     string
+		ok       bool
+	}{
+		{
+			name: "dotted path through nested string map",
+			resource: map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"uid": "abc-123",
+				},
+			},
+			path: "metadata.uid",
+			want: "abc-123",
+			ok:   true,
+		},
+		{
+			name: "dotted path through nested interface map",
+			resource: map[interface{}]interface{}{
+				"metadata": map[interface{}]interface{}{
+					"uid": "xyz-789",
+				},
+			},
+			path: "metadata.uid",
+			want: "xyz-789",
+			ok:   true,
+		},
+		{
+			name: "json number conversion",
+			resource: map[string]interface{}{
+				"id": json.Number("42"),
+			},
+			path: "id",
+			want: "42",
+			ok:   true,
+		},
+		{
+			name: "float64 conversion",
+			resource: map[string]interface{}{
+				"id": 42.5,
+			},
+			path: "id",
+			want: "42.5",
+			ok:   true,
+		},
+		{
+			name: "float32 conversion",
+			resource: map[string]interface{}{
+				"id": float32(7.25),
+			},
+			path: "id",
+			want: "7.25",
+			ok:   true,
+		},
+		{
+			name: "int conversion",
+			resource: map[string]interface{}{
+				"id": 17,
+			},
+			path: "id",
+			want: "17",
+			ok:   true,
+		},
+		{
+			name: "int64 conversion",
+			resource: map[string]interface{}{
+				"id": int64(9001),
+			},
+			path: "id",
+			want: "9001",
+			ok:   true,
+		},
+		{
+			name: "bool conversion",
+			resource: map[string]interface{}{
+				"id": true,
+			},
+			path: "id",
+			want: "true",
+			ok:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := resourceStringAtPath(tt.resource, tt.path)
+			if ok != tt.ok {
+				t.Fatalf("expected ok=%t, got %t", tt.ok, ok)
+			}
+			if got != tt.want {
+				t.Fatalf("expected value %q, got %q", tt.want, got)
+			}
+		})
 	}
 }
 
