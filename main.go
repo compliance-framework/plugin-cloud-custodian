@@ -1060,7 +1060,7 @@ func (p *CloudCustodianPlugin) Init(req *proto.InitRequest, apiHelper runner.Api
 	}
 
 	resourceTypes := p.uniqueResourceTypes()
-	subjectTemplates := p.buildSubjectTemplates()
+	subjectTemplates := p.buildSubjectTemplates(resourceTypes)
 	templateNames := make([]string, 0, len(subjectTemplates))
 	for _, subjectTemplate := range subjectTemplates {
 		templateNames = append(templateNames, subjectTemplate.GetName())
@@ -1093,8 +1093,7 @@ func (p *CloudCustodianPlugin) Init(req *proto.InitRequest, apiHelper runner.Api
 	return resp, nil
 }
 
-func (p *CloudCustodianPlugin) buildSubjectTemplates() []*proto.SubjectTemplate {
-	resourceTypes := p.uniqueResourceTypes()
+func (p *CloudCustodianPlugin) buildSubjectTemplates(resourceTypes []string) []*proto.SubjectTemplate {
 	templates := make([]*proto.SubjectTemplate, 0, len(resourceTypes))
 	for _, resourceType := range resourceTypes {
 		provider := extractProvider(resourceType)
@@ -1418,7 +1417,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 
 	checkID := fmt.Sprintf("cloud-custodian-check/%s-%d", sanitizeIdentifier(payload.Check.Name), payload.Check.Index+1)
 	providerID := fmt.Sprintf("cloud-provider/%s", sanitizeIdentifier(payload.Check.Provider))
-	resourceID := fmt.Sprintf(
+	resourceSubjectID := fmt.Sprintf(
 		"cloud-custodian-resource/%s/%s",
 		url.PathEscape(payload.Resource.Type),
 		url.PathEscape(payload.Resource.ID),
@@ -1483,7 +1482,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 	subjects := []*proto.Subject{
 		{
 			Type:       proto.SubjectType_SUBJECT_TYPE_RESOURCE,
-			Identifier: resourceID,
+			Identifier: resourceSubjectID,
 			Links: []*proto.Link{
 				{
 					Href: payload.Resource.ID,
