@@ -1288,6 +1288,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 		if len(check.ParseErrors) > 0 {
 			p.Logger.Warn("Skipping custodian execution due to check parse issues", "check_name", check.Name, "parse_errors", check.ParseErrors)
 			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("check %s has parse errors: %s", check.Name, strings.Join(check.ParseErrors, "; ")))
+			hadCheckExecutionFailures = true
 			continue
 		}
 
@@ -1299,6 +1300,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			}
 			p.Logger.Error("Skipping check due to unavailable inventory baseline", "check_name", check.Name, "resource", check.Resource, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			hadCheckExecutionFailures = true
 			continue
 		}
 

@@ -778,6 +778,50 @@ func TestEvalLoopBehavior(t *testing.T) {
 	})
 }
 
+func TestEvalFailsWhenInventoryBaselineErrors(t *testing.T) {
+	now := time.Now().UTC()
+	executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+		"inventory-aws-s3": {
+			StartedAt: now,
+			EndedAt:   now.Add(5 * time.Millisecond),
+			ExitCode:  1,
+			Error:     "inventory execution failed",
+			Err:       errors.New("inventory execution failed"),
+			Resources: []interface{}{},
+		},
+		"check-a": {
+			StartedAt: now,
+			EndedAt:   now.Add(20 * time.Millisecond),
+			ExitCode:  0,
+			Resources: []interface{}{map[string]interface{}{"id": "1"}},
+		},
+	}}
+
+	apiHelper := &fakeAPIHelper{}
+	plugin := &CloudCustodianPlugin{
+		Logger: hclog.NewNullLogger(),
+		parsedConfig: &ParsedConfig{
+			CheckTimeout: 30 * time.Second,
+		},
+		checks: []CustodianCheck{
+			{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+		},
+		executor:  executor,
+		evaluator: &fakePolicyEvaluator{},
+	}
+
+	resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+	if err == nil {
+		t.Fatal("expected eval failure when inventory baseline errors")
+	}
+	if resp.GetStatus() != proto.ExecutionStatus_FAILURE {
+		t.Fatalf("expected failure status, got %s", resp.GetStatus().String())
+	}
+	if apiHelper.calls != 0 {
+		t.Fatalf("expected no evidence submitted when baseline unavailable, got %d calls", apiHelper.calls)
+	}
+}
+
 func TestConfigureLoadsChecks(t *testing.T) {
 	stubLookPath(t, func(binary string) (string, error) {
 		return "/usr/local/bin/" + binary, nil
