@@ -802,6 +802,60 @@ func TestEvalLoopBehavior(t *testing.T) {
 			t.Fatalf("expected resource_id subject prop, got %#v", resourceSubject.Props)
 		}
 	})
+
+	t.Run("flushes evidence in bounded batches", func(t *testing.T) {
+		baselineResources := make([]interface{}, 0, evidenceBatchSize+1)
+		for i := 0; i < evidenceBatchSize+1; i++ {
+			baselineResources = append(baselineResources, map[string]interface{}{
+				"id": fmt.Sprintf("resource-%03d", i),
+			})
+		}
+
+		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now,
+				ExitCode:  0,
+				Resources: baselineResources,
+			},
+			"check-a": {
+				StartedAt: now,
+				EndedAt:   now,
+				ExitCode:  0,
+				Resources: []interface{}{},
+			},
+		}}
+
+		evaluator := &fakePolicyEvaluator{}
+		apiHelper := &fakeAPIHelper{}
+
+		plugin := &CloudCustodianPlugin{
+			Logger: hclog.NewNullLogger(),
+			parsedConfig: &ParsedConfig{
+				PolicyLabels: map[string]string{},
+				CheckTimeout: 30 * time.Second,
+			},
+			checks: []CustodianCheck{
+				{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+			},
+			executor:  executor,
+			evaluator: evaluator,
+		}
+
+		resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+		if err != nil {
+			t.Fatalf("unexpected eval error: %v", err)
+		}
+		if resp.GetStatus() != proto.ExecutionStatus_SUCCESS {
+			t.Fatalf("expected success status, got %s", resp.GetStatus().String())
+		}
+		if apiHelper.calls != 2 {
+			t.Fatalf("expected CreateEvidence twice for batched submission, got %d", apiHelper.calls)
+		}
+		if len(apiHelper.evidence) != evidenceBatchSize+1 {
+			t.Fatalf("expected %d evidences total, got %d", evidenceBatchSize+1, len(apiHelper.evidence))
+		}
+	})
 }
 
 func TestConfigureLoadsChecks(t *testing.T) {
