@@ -755,7 +755,7 @@ func hashResource(resource interface{}) string {
 		content = []byte(fmt.Sprintf("%#v", resource))
 	}
 	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])[:16]
+	return hex.EncodeToString(sum[:])
 }
 
 func buildInventoryCheck(resourceType string) CustodianCheck {
@@ -1137,8 +1137,8 @@ func (p *CloudCustodianPlugin) buildSubjectTemplates() []*proto.SubjectTemplate 
 		provider := extractProvider(resourceType)
 		templates = append(templates, &proto.SubjectTemplate{
 			Name: fmt.Sprintf("cloud-custodian-%s", sanitizeIdentifier(resourceType)),
-			// So that automation renders component definitions
-			Type:                proto.SubjectType_SUBJECT_TYPE_COMPONENT,
+			// These templates represent cloud resources collected during evaluation.
+			Type:                proto.SubjectType_SUBJECT_TYPE_RESOURCE,
 			TitleTemplate:       "Cloud Resource: {{ .resource_type }} {{ .resource_id }}",
 			DescriptionTemplate: "Cloud Custodian resource {{ .resource_id }} of type {{ .resource_type }} from provider {{ .provider }}",
 			PurposeTemplate:     "Represents a cloud resource collected by Cloud Custodian for compliance evaluation.",
@@ -1620,6 +1620,18 @@ func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePay
 	if payload == nil || !p.Logger.IsDebug() {
 		return
 	}
+
+	if p.parsedConfig == nil || !p.parsedConfig.DebugDumpPayloads {
+		p.Logger.Debug("Policy payload",
+			"check_name", payload.Check.Name,
+			"resource_id", payload.Resource.ID,
+			"assessment_status", payload.Assessment.Status,
+			"resource_type", payload.Resource.Type,
+			"provider", payload.Resource.Provider,
+		)
+		return
+	}
+
 	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		p.Logger.Debug("Policy payload serialization failed",
@@ -1629,7 +1641,7 @@ func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePay
 		)
 		return
 	}
-	p.Logger.Debug("Policy payload",
+	p.Logger.Debug("Policy payload with data",
 		"check_name", payload.Check.Name,
 		"resource_id", payload.Resource.ID,
 		"assessment_status", payload.Assessment.Status,

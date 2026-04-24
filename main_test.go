@@ -801,6 +801,13 @@ func TestBuildResourceRecordCanonicalizesHostedZoneARN(t *testing.T) {
 	}
 }
 
+func TestHashResourceUsesFullSHA256Digest(t *testing.T) {
+	got := hashResource(map[string]interface{}{"id": "example", "name": "bucket"})
+	if len(got) != 64 {
+		t.Fatalf("expected full sha256 hex digest length 64, got %d (%q)", len(got), got)
+	}
+}
+
 func TestInitUpsertsSubjectAndRiskTemplates(t *testing.T) {
 	policyDir := t.TempDir()
 	rego := `package compliance_framework.cloud_custodian_test
