@@ -593,6 +593,12 @@ func disambiguateResourceRecords(records []ResourceRecord, collisionIDs map[stri
 				suffix = hash
 			}
 			disambiguatedID := fmt.Sprintf("%s#%s", resourceID, suffix)
+			for i := 2; ; i++ {
+				if _, exists := result[disambiguatedID]; !exists {
+					break
+				}
+				disambiguatedID = fmt.Sprintf("%s#%s-%d", resourceID, suffix, i)
+			}
 			disambiguated.ID = disambiguatedID
 			result[disambiguatedID] = disambiguated
 		}
@@ -1320,12 +1326,12 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			"check_name", check.Name,
 			"payload_count", len(payloads),
 			"matched_resource_count", len(execution.Resources),
-			"baseline_resource_count", len(baseline.Resources),
+			"baseline_resource_count", len(baseline.Records),
 			"compliant_resource_count", payloadStats.Compliant,
 			"non_compliant_resource_count", payloadStats.NonCompliant,
 			"missing_from_baseline_count", payloadStats.MissingFromBaseline,
 		)
-		if len(baseline.Resources) == 0 && len(execution.Resources) > 0 {
+		if len(baseline.Records) == 0 && len(execution.Resources) > 0 {
 			p.Logger.Warn("No compliant resource payloads can be generated because inventory baseline is empty while policy returned matched resources",
 				"check_name", check.Name,
 				"resource", check.Resource,
