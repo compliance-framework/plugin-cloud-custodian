@@ -560,6 +560,36 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 	}
 }
 
+func disambiguateResourceRecords(records []ResourceRecord) (map[string]ResourceRecord, int) {
+	grouped := map[string][]ResourceRecord{}
+	for _, record := range records {
+		grouped[record.ID] = append(grouped[record.ID], record)
+	}
+
+	result := make(map[string]ResourceRecord, len(records))
+	collisionCount := 0
+	for resourceID, group := range grouped {
+		if len(group) == 1 {
+			result[resourceID] = group[0]
+			continue
+		}
+
+		collisionCount += len(group) - 1
+		for _, record := range group {
+			disambiguated := record
+			if disambiguated.IdentityFields == nil {
+				disambiguated.IdentityFields = map[string]string{}
+			}
+			hash := hashResource(disambiguated.Data)
+			disambiguated.IdentityFields["resource_hash"] = hash
+			disambiguated.ID = fmt.Sprintf("%s#%s", resourceID, hash)
+			result[disambiguated.ID] = disambiguated
+		}
+	}
+
+	return result, collisionCount
+}
+
 func (p *CloudCustodianPlugin) buildResourceRecord(resourceType string, resource interface{}) ResourceRecord {
 	provider := extractProvider(resourceType)
 	identityFields := map[string]string{}
@@ -1289,15 +1319,18 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 		if baseline.Err == nil && execution.Error != "" {
 			baseline.Err = errors.New(execution.Error)
 		}
+		records := make([]ResourceRecord, 0, len(execution.Resources))
 		for _, resource := range execution.Resources {
-			record := p.buildResourceRecord(resourceType, resource)
-			baseline.Resources[record.ID] = record
+			records = append(records, p.buildResourceRecord(resourceType, resource))
 		}
+		collisionCount := 0
+		baseline.Resources, collisionCount = disambiguateResourceRecords(records)
 		baselines[resourceType] = baseline
 		p.Logger.Debug("Collected inventory baseline",
 			"resource", resourceType,
 			"resource_count", len(baseline.Resources),
 			"raw_resource_count", len(execution.Resources),
+			"id_collision_count", collisionCount,
 			"resources_path", execution.ResourcesPath,
 			"exit_code", execution.ExitCode,
 			"had_error", baseline.Err != nil,
@@ -1312,10 +1345,17 @@ func (p *CloudCustodianPlugin) buildResourcePayloadsForCheck(
 	execution CustodianExecutionResult,
 	baseline *InventoryBaseline,
 ) []*StandardizedResourcePayload {
-	matched := map[string]ResourceRecord{}
+	matchedRecords := make([]ResourceRecord, 0, len(execution.Resources))
 	for _, resource := range execution.Resources {
-		record := p.buildResourceRecord(check.Resource, resource)
-		matched[record.ID] = record
+		matchedRecords = append(matchedRecords, p.buildResourceRecord(check.Resource, resource))
+	}
+	matched, collisionCount := disambiguateResourceRecords(matchedRecords)
+	if collisionCount > 0 {
+		p.Logger.Warn("Detected duplicate matched resource identifiers; disambiguating with resource hashes",
+			"check_name", check.Name,
+			"resource", check.Resource,
+			"id_collision_count", collisionCount,
+		)
 	}
 
 	resourceIDs := make([]string, 0, len(baseline.Resources)+len(matched))

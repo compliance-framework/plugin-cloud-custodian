@@ -846,6 +846,57 @@ func TestBuildResourceRecordCanonicalizesHostedZoneARN(t *testing.T) {
 	}
 }
 
+func TestBuildResourcePayloadsForCheckDisambiguatesDuplicateResourceIDs(t *testing.T) {
+	plugin := &CloudCustodianPlugin{
+		Logger: hclog.NewNullLogger(),
+		parsedConfig: &ParsedConfig{
+			ResourceIdentityFields: map[string][]string{
+				"aws.s3": {"Name"},
+			},
+		},
+	}
+
+	resources := []interface{}{
+		map[string]interface{}{
+			"Name": "shared-name",
+			"Arn":  "arn:aws:s3:::baseline-one",
+		},
+		map[string]interface{}{
+			"Name": "shared-name",
+			"Arn":  "arn:aws:s3:::baseline-two",
+		},
+	}
+	baselineRecords := make([]ResourceRecord, 0, len(resources))
+	for _, resource := range resources {
+		baselineRecords = append(baselineRecords, plugin.buildResourceRecord("aws.s3", resource))
+	}
+	disambiguatedBaseline, _ := disambiguateResourceRecords(baselineRecords)
+
+	baseline := &InventoryBaseline{
+		ResourceType: "aws.s3",
+		Provider:     "aws",
+		Resources:    disambiguatedBaseline,
+	}
+
+	execution := CustodianExecutionResult{
+		Resources: resources,
+	}
+
+	payloads := plugin.buildResourcePayloadsForCheck(
+		CustodianCheck{Name: "duplicate-id-check", Resource: "aws.s3", Provider: "aws"},
+		execution,
+		baseline,
+	)
+	if len(payloads) != 2 {
+		t.Fatalf("expected two payloads for duplicate resource IDs, got %d", len(payloads))
+	}
+	for _, payload := range payloads {
+		if payload.Assessment.Status != "non_compliant" {
+			t.Fatalf("expected duplicate matched resources to remain non_compliant, got %s", payload.Assessment.Status)
+		}
+	}
+}
+
 func TestResourceStringAtPath(t *testing.T) {
 	tests := []struct {
 		name     string
