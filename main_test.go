@@ -844,7 +844,7 @@ func TestBuildResourcePayloadsForCheckDisambiguatesDuplicateResourceIDs(t *testi
 	for _, resource := range resources {
 		baselineRecords = append(baselineRecords, plugin.buildResourceRecord("aws.s3", resource))
 	}
-	disambiguatedBaseline, _ := disambiguateResourceRecords(baselineRecords)
+	disambiguatedBaseline, _ := disambiguateResourceRecords(baselineRecords, resourceIDCollisions(baselineRecords))
 
 	baseline := &InventoryBaseline{
 		ResourceType: "aws.s3",

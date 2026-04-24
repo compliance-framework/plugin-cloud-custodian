@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -439,6 +440,7 @@ type ResourceRecord struct {
 
 type InventoryBaseline struct {
 	Execution    CustodianExecutionResult
+	Records      []ResourceRecord
 	Resources    map[string]ResourceRecord
 	ResourceType string
 	Provider     string
@@ -521,21 +523,60 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 	}
 }
 
-func resourceRecordKey(record ResourceRecord) string {
-	return fmt.Sprintf("%s#%s", record.ID, hashResource(record.Data))
+func resourceRecordDisambiguator(record ResourceRecord) string {
+	identityFields := map[string]string{}
+	for key, value := range record.IdentityFields {
+		if key == "resource_hash" || strings.TrimSpace(value) == "" || value == record.ID {
+			continue
+		}
+		identityFields[key] = value
+	}
+	if len(identityFields) > 0 {
+		return stableHashValue(identityFields)
+	}
+	return hashResource(record.Data)
 }
 
-func disambiguateResourceRecords(records []ResourceRecord) (map[string]ResourceRecord, int) {
+func resourceIDCollisions(records []ResourceRecord) map[string]bool {
+	counts := map[string]int{}
+	for _, record := range records {
+		counts[record.ID]++
+	}
+	collisions := map[string]bool{}
+	for resourceID, count := range counts {
+		if count > 1 {
+			collisions[resourceID] = true
+		}
+	}
+	return collisions
+}
+
+func mergeCollisionIDs(groups ...map[string]bool) map[string]bool {
+	merged := map[string]bool{}
+	for _, group := range groups {
+		for resourceID := range group {
+			merged[resourceID] = true
+		}
+	}
+	return merged
+}
+
+func disambiguateResourceRecords(records []ResourceRecord, collisionIDs map[string]bool) (map[string]ResourceRecord, int) {
+	result := make(map[string]ResourceRecord, len(records))
+	collisionCount := 0
 	grouped := map[string][]ResourceRecord{}
 	for _, record := range records {
 		grouped[record.ID] = append(grouped[record.ID], record)
 	}
-
-	result := make(map[string]ResourceRecord, len(records))
-	collisionCount := 0
-	for _, group := range grouped {
-		if len(group) > 1 {
-			collisionCount += len(group) - 1
+	for resourceID, group := range grouped {
+		if !collisionIDs[resourceID] {
+			result[resourceID] = group[0]
+			continue
+		}
+		collisionCount += len(group) - 1
+		suffixCounts := map[string]int{}
+		for _, record := range group {
+			suffixCounts[resourceRecordDisambiguator(record)]++
 		}
 		for _, record := range group {
 			disambiguated := record
@@ -544,11 +585,86 @@ func disambiguateResourceRecords(records []ResourceRecord) (map[string]ResourceR
 			}
 			hash := hashResource(disambiguated.Data)
 			disambiguated.IdentityFields["resource_hash"] = hash
-			result[resourceRecordKey(disambiguated)] = disambiguated
+			suffix := resourceRecordDisambiguator(disambiguated)
+			if suffixCounts[suffix] > 1 {
+				suffix = hash
+			}
+			result[fmt.Sprintf("%s#%s", resourceID, suffix)] = disambiguated
 		}
 	}
 
 	return result, collisionCount
+}
+
+func normalizeForHash(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		normalized := make(map[string]interface{}, len(typed))
+		for key, nested := range typed {
+			normalized[key] = normalizeForHash(nested)
+		}
+		return normalized
+	case map[interface{}]interface{}:
+		normalized := make(map[string]interface{}, len(typed))
+		keys := make([]string, 0, len(typed))
+		keyedValues := make(map[string]interface{}, len(typed))
+		for key, nested := range typed {
+			stringKey := fmt.Sprint(key)
+			keys = append(keys, stringKey)
+			keyedValues[stringKey] = normalizeForHash(nested)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			normalized[key] = keyedValues[key]
+		}
+		return normalized
+	case []interface{}:
+		normalized := make([]interface{}, 0, len(typed))
+		for _, item := range typed {
+			normalized = append(normalized, normalizeForHash(item))
+		}
+		return normalized
+	}
+
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() {
+		return nil
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		keys := rv.MapKeys()
+		stringKeys := make([]string, 0, len(keys))
+		keyedValues := make(map[string]interface{}, len(keys))
+		for _, key := range keys {
+			stringKey := fmt.Sprint(key.Interface())
+			stringKeys = append(stringKeys, stringKey)
+			keyedValues[stringKey] = normalizeForHash(rv.MapIndex(key).Interface())
+		}
+		slices.Sort(stringKeys)
+		normalized := make(map[string]interface{}, len(keys))
+		for _, key := range stringKeys {
+			normalized[key] = keyedValues[key]
+		}
+		return normalized
+	case reflect.Slice, reflect.Array:
+		length := rv.Len()
+		normalized := make([]interface{}, 0, length)
+		for i := 0; i < length; i++ {
+			normalized = append(normalized, normalizeForHash(rv.Index(i).Interface()))
+		}
+		return normalized
+	default:
+		return value
+	}
+}
+
+func stableHashValue(value interface{}) string {
+	content, err := json.Marshal(normalizeForHash(value))
+	if err != nil {
+		content = []byte(fmt.Sprintf("%T:%v", value, value))
+	}
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 func (p *CloudCustodianPlugin) buildResourceRecord(resourceType string, resource interface{}) ResourceRecord {
@@ -704,9 +820,10 @@ func resourceStringAtPath(resource interface{}, fieldPath string) (string, bool)
 }
 
 func hashResource(resource interface{}) string {
-	content, err := json.Marshal(resource)
+	normalized := normalizeForHash(resource)
+	content, err := json.Marshal(normalized)
 	if err != nil {
-		content = []byte(fmt.Sprintf("%#v", resource))
+		content = []byte(fmt.Sprintf("%#v", normalized))
 	}
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
@@ -1235,7 +1352,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			if evalErr != nil {
 				accumulatedErrors = errors.Join(accumulatedErrors, evalErr)
 			}
-			if len(pendingEvidences) >= evidenceBatchSize {
+			for len(pendingEvidences) >= evidenceBatchSize {
 				if err := p.submitEvidenceBatch(ctx, apiHelper, pendingEvidences[:evidenceBatchSize]); err != nil {
 					return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
 				}
@@ -1245,8 +1362,15 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	}
 
 	if len(pendingEvidences) > 0 {
-		if err := p.submitEvidenceBatch(ctx, apiHelper, pendingEvidences); err != nil {
-			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
+		for len(pendingEvidences) > 0 {
+			batch := pendingEvidences
+			if len(batch) > evidenceBatchSize {
+				batch = batch[:evidenceBatchSize]
+			}
+			if err := p.submitEvidenceBatch(ctx, apiHelper, batch); err != nil {
+				return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
+			}
+			pendingEvidences = pendingEvidences[len(batch):]
 		}
 	} else {
 		p.Logger.Warn("No evidence generated by current evaluation run")
@@ -1297,19 +1421,21 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 		if execution.Err != nil || execution.Error != "" {
 			baselineErr = formatExecutionFailure(check.Name, execution)
 		}
+		records := make([]ResourceRecord, 0, len(execution.Resources))
+		for _, resource := range execution.Resources {
+			records = append(records, p.buildResourceRecord(resourceType, resource))
+		}
 		baseline := &InventoryBaseline{
 			Execution:    execution,
+			Records:      records,
 			Resources:    map[string]ResourceRecord{},
 			ResourceType: resourceType,
 			Provider:     extractProvider(resourceType),
 			Err:          baselineErr,
 		}
-		records := make([]ResourceRecord, 0, len(execution.Resources))
-		for _, resource := range execution.Resources {
-			records = append(records, p.buildResourceRecord(resourceType, resource))
-		}
+		collisionIDs := resourceIDCollisions(records)
 		collisionCount := 0
-		baseline.Resources, collisionCount = disambiguateResourceRecords(records)
+		baseline.Resources, collisionCount = disambiguateResourceRecords(records, collisionIDs)
 		baselines[resourceType] = baseline
 		p.Logger.Debug("Collected inventory baseline",
 			"resource", resourceType,
@@ -1334,18 +1460,30 @@ func (p *CloudCustodianPlugin) buildResourcePayloadsForCheck(
 	for _, resource := range execution.Resources {
 		matchedRecords = append(matchedRecords, p.buildResourceRecord(check.Resource, resource))
 	}
-	matched, collisionCount := disambiguateResourceRecords(matchedRecords)
+	collisionIDs := mergeCollisionIDs(
+		resourceIDCollisions(baseline.Records),
+		resourceIDCollisions(matchedRecords),
+	)
+	baselineResources, baselineCollisionCount := disambiguateResourceRecords(baseline.Records, collisionIDs)
+	matched, collisionCount := disambiguateResourceRecords(matchedRecords, collisionIDs)
+	if baselineCollisionCount > 0 {
+		p.Logger.Warn("Detected duplicate baseline resource identifiers; disambiguating with stable secondary keys",
+			"check_name", check.Name,
+			"resource", check.Resource,
+			"id_collision_count", baselineCollisionCount,
+		)
+	}
 	if collisionCount > 0 {
-		p.Logger.Warn("Detected duplicate matched resource identifiers; disambiguating with resource hashes",
+		p.Logger.Warn("Detected duplicate matched resource identifiers; disambiguating with stable secondary keys",
 			"check_name", check.Name,
 			"resource", check.Resource,
 			"id_collision_count", collisionCount,
 		)
 	}
 
-	resourceIDs := make([]string, 0, len(baseline.Resources)+len(matched))
+	resourceIDs := make([]string, 0, len(baselineResources)+len(matched))
 	seen := map[string]bool{}
-	for resourceID := range baseline.Resources {
+	for resourceID := range baselineResources {
 		resourceIDs = append(resourceIDs, resourceID)
 		seen[resourceID] = true
 	}
@@ -1359,7 +1497,7 @@ func (p *CloudCustodianPlugin) buildResourcePayloadsForCheck(
 
 	payloads := make([]*StandardizedResourcePayload, 0, len(resourceIDs))
 	for _, resourceID := range resourceIDs {
-		record, existsInBaseline := baseline.Resources[resourceID]
+		record, existsInBaseline := baselineResources[resourceID]
 		matchedRecord, isMatched := matched[resourceID]
 		inventoryStatus := "baseline"
 		if !existsInBaseline {
