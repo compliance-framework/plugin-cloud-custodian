@@ -101,6 +101,9 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 			if len(normalizedFields) == 0 {
 				return nil, fmt.Errorf("resource_identity_fields for %q must include at least one field", trimmedType)
 			}
+			if _, exists := normalizedIdentityFields[trimmedType]; exists {
+				return nil, fmt.Errorf("resource_identity_fields contains duplicate resource type %q after trimming whitespace", trimmedType)
+			}
 			normalizedIdentityFields[trimmedType] = normalizedFields
 		}
 		resourceIdentityFields = normalizedIdentityFields
