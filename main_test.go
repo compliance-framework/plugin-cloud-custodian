@@ -415,86 +415,6 @@ sleep 2
 	})
 }
 
-func TestBuildCheckPayload(t *testing.T) {
-	now := time.Now().UTC()
-	check := CustodianCheck{
-		Index:    0,
-		Name:     "s3-check",
-		Resource: "aws.s3",
-		Provider: "aws",
-		RawPolicy: map[string]interface{}{
-			"name":     "s3-check",
-			"resource": "aws.s3",
-			"mode": map[string]interface{}{
-				"type": "periodic",
-			},
-		},
-	}
-
-	success := buildCheckPayload(check, CustodianExecutionResult{
-		StartedAt:     now,
-		EndedAt:       now.Add(2 * time.Second),
-		ExitCode:      0,
-		Stdout:        "ok",
-		Resources:     []interface{}{map[string]interface{}{"id": "a"}},
-		ArtifactPath:  "/tmp/out",
-		ResourcesPath: "/tmp/out/s3/resources.json",
-	})
-
-	if success.SchemaVersion != "v1" {
-		t.Fatalf("expected schema version v1")
-	}
-	if success.Execution.Status != "success" {
-		t.Fatalf("expected success status")
-	}
-	if success.Result.MatchedResourceCount != 1 {
-		t.Fatalf("expected matched count 1, got %d", success.Result.MatchedResourceCount)
-	}
-	if success.Check.Metadata["mode"] == nil {
-		t.Fatalf("expected metadata to include non-name/resource fields")
-	}
-
-	failure := buildCheckPayload(check, newCheckErrorExecution([]string{"parse failure"}))
-	if failure.Execution.Status != "error" {
-		t.Fatalf("expected error status")
-	}
-	if failure.Result.MatchedResourceCount != 0 {
-		t.Fatalf("expected matched count 0 for failed payload")
-	}
-	if len(failure.Execution.Errors) != 1 || failure.Execution.Errors[0] != "parse failure" {
-		t.Fatalf("expected structured execution errors in payload, got %v", failure.Execution.Errors)
-	}
-
-	minimalCheck := CustodianCheck{
-		Index:    1,
-		Name:     "minimal-check",
-		Resource: "aws.s3",
-		Provider: "aws",
-		RawPolicy: map[string]interface{}{
-			"name":     "minimal-check",
-			"resource": "aws.s3",
-		},
-	}
-	minimal := buildCheckPayload(minimalCheck, CustodianExecutionResult{
-		StartedAt: now,
-		EndedAt:   now,
-		ExitCode:  0,
-		Resources: []interface{}{},
-	})
-
-	rawJSON, err := json.Marshal(minimal)
-	if err != nil {
-		t.Fatalf("failed to marshal minimal payload: %v", err)
-	}
-	jsonText := string(rawJSON)
-	if strings.Contains(jsonText, `"metadata":{}`) {
-		t.Fatalf("expected metadata to be omitted when empty, got: %s", jsonText)
-	}
-	if strings.Contains(jsonText, `"errors":[]`) {
-		t.Fatalf("expected execution.errors to be omitted when empty, got: %s", jsonText)
-	}
-}
-
 type fakeExecutor struct {
 	calls   []CustodianExecutionRequest
 	results map[string]CustodianExecutionResult
@@ -579,7 +499,7 @@ func (f *fakeAPIHelper) UpsertSubjectTemplates(ctx context.Context, subjectTempl
 func TestEvalLoopBehavior(t *testing.T) {
 	now := time.Now().UTC()
 
-	t.Run("continues on check execution errors and submits evidence", func(t *testing.T) {
+	t.Run("returns failure when a check execution fails but still submits successful evidence", func(t *testing.T) {
 		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
 			"inventory-aws-s3": {
 				StartedAt: now,
@@ -630,11 +550,11 @@ func TestEvalLoopBehavior(t *testing.T) {
 		}
 
 		resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a", "bundle-b"}}, apiHelper)
-		if err != nil {
-			t.Fatalf("unexpected eval error: %v", err)
+		if err == nil {
+			t.Fatalf("expected eval failure when one check execution fails")
 		}
-		if resp.GetStatus() != proto.ExecutionStatus_SUCCESS {
-			t.Fatalf("expected success status, got %s", resp.GetStatus().String())
+		if resp.GetStatus() != proto.ExecutionStatus_FAILURE {
+			t.Fatalf("expected failure status, got %s", resp.GetStatus().String())
 		}
 		if len(executor.calls) != 4 {
 			t.Fatalf("expected 4 executor calls, got %d", len(executor.calls))

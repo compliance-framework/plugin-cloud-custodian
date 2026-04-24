@@ -31,7 +31,6 @@ import (
 
 const (
 	defaultCheckTimeoutSeconds  = 300
-	schemaVersionV1             = "v1"
 	schemaVersionV2             = "v2"
 	sourceCloudCustodian        = "cloud-custodian"
 	defaultRemotePolicyTimeout  = 30 * time.Second
@@ -377,16 +376,6 @@ func findResourcesJSON(outputDir string) (string, error) {
 	return found, nil
 }
 
-// StandardizedCheckPayload is the per-check OPA input contract.
-type StandardizedCheckPayload struct {
-	SchemaVersion string                  `json:"schema_version"`
-	Source        string                  `json:"source"`
-	Check         StandardizedCheckInfo   `json:"check"`
-	Execution     StandardizedExecution   `json:"execution"`
-	Result        StandardizedCheckResult `json:"result"`
-	RawPolicy     map[string]interface{}  `json:"raw_policy"`
-}
-
 type StandardizedCheckInfo struct {
 	Name     string                 `json:"name"`
 	Resource string                 `json:"resource"`
@@ -406,13 +395,6 @@ type StandardizedExecution struct {
 	Stderr     string   `json:"stderr,omitempty"`
 	Error      string   `json:"error,omitempty"`
 	Errors     []string `json:"errors,omitempty"`
-}
-
-type StandardizedCheckResult struct {
-	MatchedResourceCount int           `json:"matched_resource_count"`
-	Resources            []interface{} `json:"resources"`
-	ArtifactPath         string        `json:"artifact_path,omitempty"`
-	ResourcesPath        string        `json:"resources_path,omitempty"`
 }
 
 // StandardizedResourcePayload is the per-resource OPA input contract.
@@ -461,28 +443,6 @@ type InventoryBaseline struct {
 	ResourceType string
 	Provider     string
 	Err          error
-}
-
-func buildCheckPayload(check CustodianCheck, execution CustodianExecutionResult) *StandardizedCheckPayload {
-	return &StandardizedCheckPayload{
-		SchemaVersion: schemaVersionV1,
-		Source:        sourceCloudCustodian,
-		Check: StandardizedCheckInfo{
-			Name:     check.Name,
-			Resource: check.Resource,
-			Provider: check.Provider,
-			Index:    check.Index,
-			Metadata: buildCheckMetadata(check),
-		},
-		Execution: buildExecutionInfo(execution),
-		Result: StandardizedCheckResult{
-			MatchedResourceCount: len(execution.Resources),
-			Resources:            execution.Resources,
-			ArtifactPath:         execution.ArtifactPath,
-			ResourcesPath:        execution.ResourcesPath,
-		},
-		RawPolicy: check.RawPolicy,
-	}
 }
 
 func buildResourcePayload(
@@ -561,6 +521,10 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 	}
 }
 
+func resourceRecordKey(record ResourceRecord) string {
+	return fmt.Sprintf("%s#%s", record.ID, hashResource(record.Data))
+}
+
 func disambiguateResourceRecords(records []ResourceRecord) (map[string]ResourceRecord, int) {
 	grouped := map[string][]ResourceRecord{}
 	for _, record := range records {
@@ -569,13 +533,10 @@ func disambiguateResourceRecords(records []ResourceRecord) (map[string]ResourceR
 
 	result := make(map[string]ResourceRecord, len(records))
 	collisionCount := 0
-	for resourceID, group := range grouped {
-		if len(group) == 1 {
-			result[resourceID] = group[0]
-			continue
+	for _, group := range grouped {
+		if len(group) > 1 {
+			collisionCount += len(group) - 1
 		}
-
-		collisionCount += len(group) - 1
 		for _, record := range group {
 			disambiguated := record
 			if disambiguated.IdentityFields == nil {
@@ -583,8 +544,7 @@ func disambiguateResourceRecords(records []ResourceRecord) (map[string]ResourceR
 			}
 			hash := hashResource(disambiguated.Data)
 			disambiguated.IdentityFields["resource_hash"] = hash
-			disambiguated.ID = fmt.Sprintf("%s#%s", resourceID, hash)
-			result[disambiguated.ID] = disambiguated
+			result[resourceRecordKey(disambiguated)] = disambiguated
 		}
 	}
 
@@ -1195,6 +1155,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	totalEvidenceCount := 0
 	var accumulatedErrors error
 	successfulPolicyRuns := 0
+	hadCheckExecutionFailures := false
 
 	baselines := p.collectInventoryBaselines(ctx, executionRoot)
 	for _, check := range p.checks {
@@ -1227,6 +1188,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			err := formatExecutionFailure(check.Name, execution)
 			p.Logger.Error("Skipping resource evaluation due to check execution error", "check_name", check.Name, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			hadCheckExecutionFailures = true
 			continue
 		}
 
@@ -1296,6 +1258,12 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 		}
 		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, accumulatedErrors
 	}
+	if hadCheckExecutionFailures {
+		if accumulatedErrors == nil {
+			accumulatedErrors = errors.New("one or more cloud custodian checks failed to execute")
+		}
+		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, accumulatedErrors
+	}
 
 	if accumulatedErrors != nil {
 		p.Logger.Warn("Completed with non-fatal policy evaluation errors", "error", accumulatedErrors)
@@ -1325,15 +1293,16 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 			OutputDir:  outputDir,
 		})
 
+		var baselineErr error
+		if execution.Err != nil || execution.Error != "" {
+			baselineErr = formatExecutionFailure(check.Name, execution)
+		}
 		baseline := &InventoryBaseline{
 			Execution:    execution,
 			Resources:    map[string]ResourceRecord{},
 			ResourceType: resourceType,
 			Provider:     extractProvider(resourceType),
-			Err:          execution.Err,
-		}
-		if baseline.Err == nil && execution.Error != "" {
-			baseline.Err = errors.New(execution.Error)
+			Err:          baselineErr,
 		}
 		records := make([]ResourceRecord, 0, len(execution.Resources))
 		for _, resource := range execution.Resources {
