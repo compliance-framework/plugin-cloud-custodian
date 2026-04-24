@@ -447,7 +447,6 @@ type ResourceRecord struct {
 type InventoryBaseline struct {
 	Execution    CustodianExecutionResult
 	Records      []ResourceRecord
-	Resources    map[string]ResourceRecord
 	ResourceType string
 	Provider     string
 	Err          error
@@ -1438,21 +1437,19 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 		for _, resource := range execution.Resources {
 			records = append(records, p.buildResourceRecord(resourceType, resource))
 		}
+		collisionIDs := resourceIDCollisions(records)
+		_, collisionCount := disambiguateResourceRecords(records, collisionIDs)
 		baseline := &InventoryBaseline{
 			Execution:    execution,
 			Records:      records,
-			Resources:    map[string]ResourceRecord{},
 			ResourceType: resourceType,
 			Provider:     extractProvider(resourceType),
 			Err:          baselineErr,
 		}
-		collisionIDs := resourceIDCollisions(records)
-		collisionCount := 0
-		baseline.Resources, collisionCount = disambiguateResourceRecords(records, collisionIDs)
 		baselines[resourceType] = baseline
 		p.Logger.Debug("Collected inventory baseline",
 			"resource", resourceType,
-			"resource_count", len(baseline.Resources),
+			"resource_count", len(records),
 			"raw_resource_count", len(execution.Resources),
 			"id_collision_count", collisionCount,
 			"resources_path", execution.ResourcesPath,
