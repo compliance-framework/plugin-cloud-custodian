@@ -577,10 +577,6 @@ func disambiguateResourceRecords(records []ResourceRecord, collisionIDs map[stri
 			continue
 		}
 		collisionCount += len(group) - 1
-		suffixCounts := map[string]int{}
-		for _, record := range group {
-			suffixCounts[resourceRecordDisambiguator(record)]++
-		}
 		for _, record := range group {
 			disambiguated := record
 			if disambiguated.IdentityFields == nil {
@@ -588,9 +584,10 @@ func disambiguateResourceRecords(records []ResourceRecord, collisionIDs map[stri
 			}
 			hash := hashResource(disambiguated.Data)
 			disambiguated.IdentityFields["resource_hash"] = hash
-			suffix := resourceRecordDisambiguator(disambiguated)
-			if suffixCounts[suffix] > 1 {
-				suffix = hash
+			baseSuffix := resourceRecordDisambiguator(disambiguated)
+			suffix := hash
+			if baseSuffix != "" && baseSuffix != hash {
+				suffix = fmt.Sprintf("%s-%s", baseSuffix, hash)
 			}
 			disambiguatedID := fmt.Sprintf("%s#%s", resourceID, suffix)
 			for i := 2; ; i++ {
@@ -1797,9 +1794,16 @@ func (p *CloudCustodianPlugin) dumpStandardizedPayload(payload *StandardizedReso
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	fileName := fmt.Sprintf("%03d-%s-%d.json",
+	sanitizedCheckName := sanitizeIdentifier(payload.Check.Name)
+	sanitizedResourceID := sanitizeIdentifier(payload.Resource.ID)
+	if len(sanitizedResourceID) > 50 {
+		shortHash := hashResource(payload.Resource.ID)[:12]
+		sanitizedResourceID = sanitizedResourceID[:50] + "-" + shortHash
+	}
+	fileName := fmt.Sprintf("%03d-%s-%s-%d.json",
 		payload.Check.Index+1,
-		fmt.Sprintf("%s-%s", sanitizeIdentifier(payload.Check.Name), sanitizeIdentifier(payload.Resource.ID)),
+		sanitizedCheckName,
+		sanitizedResourceID,
 		time.Now().UTC().UnixNano(),
 	)
 	outputPath := filepath.Join(p.parsedConfig.DebugPayloadOutputDir, fileName)
