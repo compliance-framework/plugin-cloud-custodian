@@ -85,8 +85,10 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		if err := json.Unmarshal([]byte(c.ResourceIdentityFields), &resourceIdentityFields); err != nil {
 			return nil, fmt.Errorf("could not parse resource_identity_fields: %w", err)
 		}
+		normalizedIdentityFields := make(map[string][]string, len(resourceIdentityFields))
 		for resourceType, fields := range resourceIdentityFields {
-			if strings.TrimSpace(resourceType) == "" {
+			trimmedType := strings.TrimSpace(resourceType)
+			if trimmedType == "" {
 				return nil, errors.New("resource_identity_fields cannot contain an empty resource type")
 			}
 			normalizedFields := make([]string, 0, len(fields))
@@ -97,10 +99,11 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 				}
 			}
 			if len(normalizedFields) == 0 {
-				return nil, fmt.Errorf("resource_identity_fields for %q must include at least one field", resourceType)
+				return nil, fmt.Errorf("resource_identity_fields for %q must include at least one field", trimmedType)
 			}
-			resourceIdentityFields[resourceType] = normalizedFields
+			normalizedIdentityFields[trimmedType] = normalizedFields
 		}
+		resourceIdentityFields = normalizedIdentityFields
 	}
 
 	checkTimeoutSeconds := defaultCheckTimeoutSeconds
@@ -589,7 +592,9 @@ func disambiguateResourceRecords(records []ResourceRecord, collisionIDs map[stri
 			if suffixCounts[suffix] > 1 {
 				suffix = hash
 			}
-			result[fmt.Sprintf("%s#%s", resourceID, suffix)] = disambiguated
+			disambiguatedID := fmt.Sprintf("%s#%s", resourceID, suffix)
+			disambiguated.ID = disambiguatedID
+			result[disambiguatedID] = disambiguated
 		}
 	}
 

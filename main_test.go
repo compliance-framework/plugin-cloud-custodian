@@ -864,10 +864,18 @@ func TestBuildResourcePayloadsForCheckDisambiguatesDuplicateResourceIDs(t *testi
 	if len(payloads) != 2 {
 		t.Fatalf("expected two payloads for duplicate resource IDs, got %d", len(payloads))
 	}
+	seenResourceIDs := make(map[string]struct{}, len(payloads))
 	for _, payload := range payloads {
 		if payload.Assessment.Status != "non_compliant" {
 			t.Fatalf("expected duplicate matched resources to remain non_compliant, got %s", payload.Assessment.Status)
 		}
+		if payload.Resource.ID == "" {
+			t.Fatalf("expected disambiguated resource ID to be non-empty, got empty ID in payload %#v", payload)
+		}
+		seenResourceIDs[payload.Resource.ID] = struct{}{}
+	}
+	if len(seenResourceIDs) != 2 {
+		t.Fatalf("expected duplicate matched resources to have distinct resource IDs, got IDs %#v", seenResourceIDs)
 	}
 }
 
