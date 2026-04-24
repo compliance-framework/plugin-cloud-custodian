@@ -808,6 +808,30 @@ func TestHashResourceUsesFullSHA256Digest(t *testing.T) {
 	}
 }
 
+func TestFormatExecutionFailure(t *testing.T) {
+	t.Run("uses both error string and wrapped error", func(t *testing.T) {
+		err := formatExecutionFailure("check-a", CustodianExecutionResult{
+			Error: "dryrun failed",
+			Err:   errors.New("exit status 1"),
+		})
+		if !strings.Contains(err.Error(), "dryrun failed") {
+			t.Fatalf("expected formatted error to include execution.Error, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "exit status 1") {
+			t.Fatalf("expected formatted error to include execution.Err, got %v", err)
+		}
+	})
+
+	t.Run("uses wrapped error when error string is empty", func(t *testing.T) {
+		err := formatExecutionFailure("check-a", CustodianExecutionResult{
+			Err: errors.New("exit status 1"),
+		})
+		if !strings.Contains(err.Error(), "exit status 1") {
+			t.Fatalf("expected formatted error to include execution.Err, got %v", err)
+		}
+	})
+}
+
 func TestInitUpsertsSubjectAndRiskTemplates(t *testing.T) {
 	policyDir := t.TempDir()
 	rego := `package compliance_framework.cloud_custodian_test

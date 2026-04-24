@@ -1230,7 +1230,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			OutputDir:  checkDir,
 		})
 		if execution.Err != nil || execution.Error != "" {
-			err := fmt.Errorf("custodian policy execution failed for check %s: %s", check.Name, execution.Error)
+			err := formatExecutionFailure(check.Name, execution)
 			p.Logger.Error("Skipping resource evaluation due to check execution error", "check_name", check.Name, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
 			continue
@@ -1616,36 +1616,31 @@ func isReservedResourceLabel(label string) bool {
 	}
 }
 
+func formatExecutionFailure(checkName string, execution CustodianExecutionResult) error {
+	switch {
+	case execution.Error != "" && execution.Err != nil:
+		return fmt.Errorf("custodian policy execution failed for check %s: %s: %w", checkName, execution.Error, execution.Err)
+	case execution.Error != "":
+		return fmt.Errorf("custodian policy execution failed for check %s: %s", checkName, execution.Error)
+	case execution.Err != nil:
+		return fmt.Errorf("custodian policy execution failed for check %s: %w", checkName, execution.Err)
+	default:
+		return fmt.Errorf("custodian policy execution failed for check %s", checkName)
+	}
+}
+
 func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePayload) {
 	if payload == nil || !p.Logger.IsDebug() {
 		return
 	}
 
-	if p.parsedConfig == nil || !p.parsedConfig.DebugDumpPayloads {
-		p.Logger.Debug("Policy payload",
-			"check_name", payload.Check.Name,
-			"resource_id", payload.Resource.ID,
-			"assessment_status", payload.Assessment.Status,
-			"resource_type", payload.Resource.Type,
-			"provider", payload.Resource.Provider,
-		)
-		return
-	}
-
-	raw, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		p.Logger.Debug("Policy payload serialization failed",
-			"check_name", payload.Check.Name,
-			"resource_id", payload.Resource.ID,
-			"error", err,
-		)
-		return
-	}
-	p.Logger.Debug("Policy payload with data",
+	p.Logger.Debug("Policy payload",
 		"check_name", payload.Check.Name,
 		"resource_id", payload.Resource.ID,
 		"assessment_status", payload.Assessment.Status,
-		"data", string(raw),
+		"resource_type", payload.Resource.Type,
+		"provider", payload.Resource.Provider,
+		"debug_dump_payloads", p.parsedConfig != nil && p.parsedConfig.DebugDumpPayloads,
 	)
 }
 
