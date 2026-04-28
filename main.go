@@ -37,6 +37,7 @@ const (
 	defaultRemotePolicyTimeout  = 30 * time.Second
 	defaultMaxRemotePolicyBytes = 1 << 20 // 1 MiB
 	evidenceBatchSize           = 100
+	nonComplianceMessageField   = "non_compliance_message"
 )
 
 var lookPath = exec.LookPath
@@ -232,7 +233,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	e.Logger.Trace("Created output directory for check", "check_name", req.Check.Name, "output_dir", req.OutputDir)
 
 	policyDocument := map[string]interface{}{
-		"policies": []map[string]interface{}{req.Check.RawPolicy},
+		"policies": []map[string]interface{}{custodianPolicyForExecution(req.Check.RawPolicy)},
 	}
 	policyContent, err := yaml.Marshal(policyDocument)
 	if err != nil {
@@ -852,6 +853,21 @@ func buildInventoryCheck(resourceType string) CustodianCheck {
 			"resource": resourceType,
 		},
 	}
+}
+
+func custodianPolicyForExecution(policy map[string]interface{}) map[string]interface{} {
+	if policy == nil {
+		return nil
+	}
+
+	out := make(map[string]interface{}, len(policy))
+	for k, v := range policy {
+		if k == nonComplianceMessageField {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func parseCustodianChecks(policyYAML []byte) ([]CustodianCheck, error) {
