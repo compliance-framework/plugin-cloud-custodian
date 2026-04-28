@@ -252,6 +252,7 @@ func TestParseCustodianChecks(t *testing.T) {
 		checks, err := parseCustodianChecks([]byte(`policies:
   - name: s3-public
     resource: aws.s3
+    non_compliance_message: S3 bucket allows public access.
     mode:
       type: periodic
   - name: vm-policy
@@ -267,6 +268,9 @@ func TestParseCustodianChecks(t *testing.T) {
 		}
 		if len(checks[0].ParseErrors) != 0 {
 			t.Fatalf("expected no parse errors, got %v", checks[0].ParseErrors)
+		}
+		if checks[0].RawPolicy[nonComplianceMessageField] != "S3 bucket allows public access." {
+			t.Fatalf("expected non-compliance message to be preserved in raw policy, got %#v", checks[0].RawPolicy[nonComplianceMessageField])
 		}
 	})
 
@@ -411,6 +415,56 @@ sleep 2
 		}
 		if deadlineMentions > 1 {
 			t.Fatalf("expected at most one deadline exceeded entry, got: %v", result.Errors)
+		}
+	})
+
+	t.Run("strips plugin-only policy fields before custodian execution", func(t *testing.T) {
+		script := `#!/bin/sh
+set -eu
+out=""
+policy=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  case "$1" in
+    *.yaml) policy="$1" ;;
+  esac
+  shift
+done
+if grep -q non_compliance_message "$policy"; then
+  echo "unexpected non_compliance_message in custodian policy" >&2
+  exit 17
+fi
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:     "test-policy",
+				Resource: "aws.s3",
+				Provider: "aws",
+				RawPolicy: map[string]interface{}{
+					"name":                    "test-policy",
+					"resource":                "aws.s3",
+					nonComplianceMessageField: "S3 bucket allows public access.",
+				},
+			},
+			Timeout:   5 * time.Second,
+			OutputDir: filepath.Join(t.TempDir(), "out"),
+		})
+
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+		if result.ExitCode != 0 {
+			t.Fatalf("expected exit code 0, got %d: %s", result.ExitCode, result.Stderr)
 		}
 	})
 }
