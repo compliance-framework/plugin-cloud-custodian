@@ -469,6 +469,48 @@ printf '[]' > "$out/test-policy/resources.json"
 	})
 }
 
+func TestCustodianDiagnosticInterval(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "non-positive timeout uses default watch interval",
+			timeout: 0,
+			want:    custodianWatchInterval,
+		},
+		{
+			name:    "long timeout uses default watch interval",
+			timeout: 2 * custodianWatchInterval,
+			want:    custodianWatchInterval,
+		},
+		{
+			name:    "short timeout uses half timeout",
+			timeout: 8 * time.Second,
+			want:    4 * time.Second,
+		},
+		{
+			name:    "very short timeout floors at one second",
+			timeout: 1500 * time.Millisecond,
+			want:    time.Second,
+		},
+		{
+			name:    "negative timeout uses default watch interval",
+			timeout: -time.Second,
+			want:    custodianWatchInterval,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := custodianDiagnosticInterval(tt.timeout); got != tt.want {
+				t.Fatalf("expected %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
 type fakeExecutor struct {
 	calls   []CustodianExecutionRequest
 	results map[string]CustodianExecutionResult
