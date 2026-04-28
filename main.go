@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	policyManager "github.com/compliance-framework/agent/policy-manager"
@@ -38,6 +39,8 @@ const (
 	defaultMaxRemotePolicyBytes = 1 << 20 // 1 MiB
 	evidenceBatchSize           = 100
 	nonComplianceMessageField   = "non_compliance_message"
+	custodianWatchInterval      = 30 * time.Second
+	custodianOutputTailBytes    = 4096
 )
 
 var lookPath = exec.LookPath
@@ -204,6 +207,51 @@ type CommandCustodianExecutor struct {
 	Logger hclog.Logger
 }
 
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *lockedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *lockedBuffer) Tail(maxBytes int) string {
+	content := b.String()
+	if maxBytes <= 0 || len(content) <= maxBytes {
+		return content
+	}
+	return content[len(content)-maxBytes:]
+}
+
+func custodianDiagnosticInterval(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return custodianWatchInterval
+	}
+	interval := custodianWatchInterval
+	if timeout < 2*interval {
+		interval = timeout / 2
+	}
+	if interval < time.Second {
+		return time.Second
+	}
+	return interval
+}
+
 func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExecutionRequest) CustodianExecutionResult {
 	e.Logger.Debug("Starting cloud custodian execution",
 		"check_name", req.Check.Name,
@@ -270,12 +318,101 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		"command", req.BinaryPath,
 		"args", args,
 	)
-	var stdoutBuf bytes.Buffer
-	var stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := &lockedBuffer{}
+	stderrBuf := &lockedBuffer{}
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
-	err = cmd.Run()
+	err = cmd.Start()
+	if err == nil {
+		pid := -1
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+		e.Logger.Info("Custodian command process started",
+			"check_name", req.Check.Name,
+			"pid", pid,
+		)
+
+		waitDone := make(chan error, 1)
+		e.Logger.Debug("Setting up custodian command wait channel",
+			"check_name", req.Check.Name,
+			"pid", pid,
+			"buffered", true,
+			"capacity", cap(waitDone),
+		)
+		go func() {
+			waitDone <- cmd.Wait()
+		}()
+
+		diagnosticInterval := custodianDiagnosticInterval(req.Timeout)
+		ticker := time.NewTicker(diagnosticInterval)
+		defer ticker.Stop()
+		contextDoneLogged := false
+		runCtxDone := runCtx.Done()
+		e.Logger.Debug("Starting custodian command monitor loop",
+			"check_name", req.Check.Name,
+			"pid", pid,
+			"diagnostic_interval", diagnosticInterval.String(),
+			"timeout", req.Timeout.String(),
+		)
+
+		for {
+			select {
+			case err = <-waitDone:
+				e.Logger.Info("Custodian command wait completed",
+					"check_name", req.Check.Name,
+					"pid", pid,
+					"elapsed", time.Since(result.StartedAt).Round(time.Second).String(),
+					"wait_error", err,
+					"context_error", runCtx.Err(),
+					"stdout_len", stdoutBuf.Len(),
+					"stderr_len", stderrBuf.Len(),
+				)
+				goto commandFinished
+			case <-ticker.C:
+				elapsed := time.Since(result.StartedAt).Round(time.Second).String()
+				remaining := ""
+				if deadline, ok := runCtx.Deadline(); ok {
+					remaining = time.Until(deadline).Round(time.Second).String()
+				}
+				e.Logger.Warn("Custodian command still running",
+					"check_name", req.Check.Name,
+					"pid", pid,
+					"elapsed", elapsed,
+					"remaining", remaining,
+					"timeout", req.Timeout.String(),
+					"stdout_len", stdoutBuf.Len(),
+					"stderr_len", stderrBuf.Len(),
+					"stderr_tail", stderrBuf.Tail(custodianOutputTailBytes),
+				)
+			case <-runCtxDone:
+				if !contextDoneLogged {
+					e.Logger.Warn("Custodian command context done while process is still running",
+						"check_name", req.Check.Name,
+						"pid", pid,
+						"elapsed", time.Since(result.StartedAt).Round(time.Second).String(),
+						"timeout", req.Timeout.String(),
+						"context_error", runCtx.Err(),
+						"stdout_len", stdoutBuf.Len(),
+						"stderr_len", stderrBuf.Len(),
+						"stderr_tail", stderrBuf.Tail(custodianOutputTailBytes),
+					)
+					contextDoneLogged = true
+				}
+				runCtxDone = nil
+			}
+		}
+	} else {
+		e.Logger.Warn("Failed to start custodian command process",
+			"check_name", req.Check.Name,
+			"command", req.BinaryPath,
+			"args", args,
+			"error", err,
+		)
+	}
+
+commandFinished:
 	result.Stdout = stdoutBuf.String()
 	result.Stderr = stderrBuf.String()
 	if cmd.ProcessState != nil {
