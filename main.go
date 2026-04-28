@@ -231,11 +231,14 @@ func (b *lockedBuffer) Len() int {
 }
 
 func (b *lockedBuffer) Tail(maxBytes int) string {
-	content := b.String()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	content := b.buf.Bytes()
 	if maxBytes <= 0 || len(content) <= maxBytes {
-		return content
+		return string(content)
 	}
-	return content[len(content)-maxBytes:]
+	return string(content[len(content)-maxBytes:])
 }
 
 func custodianDiagnosticInterval(timeout time.Duration) time.Duration {
@@ -376,7 +379,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 				if deadline, ok := runCtx.Deadline(); ok {
 					remaining = time.Until(deadline).Round(time.Second).String()
 				}
-				e.Logger.Warn("Custodian command still running",
+				e.Logger.Info("Custodian command still running",
 					"check_name", req.Check.Name,
 					"pid", pid,
 					"elapsed", elapsed,
@@ -384,7 +387,6 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 					"timeout", req.Timeout.String(),
 					"stdout_len", stdoutBuf.Len(),
 					"stderr_len", stderrBuf.Len(),
-					"stderr_tail", stderrBuf.Tail(custodianOutputTailBytes),
 				)
 			case <-runCtxDone:
 				if !contextDoneLogged {
