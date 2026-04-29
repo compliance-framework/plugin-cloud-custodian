@@ -28,7 +28,7 @@ This plugin always enforces read-only Cloud Custodian execution:
 
 - `--dryrun` is always used.
 - Mutating actions are not applied.
-- For AWS checks, the plugin runs with `--region all` to evaluate across all AWS regions by default.
+- For AWS checks, the plugin runs with `--region all` to evaluate across all AWS regions by default unless `aws_regions` is configured.
 
 ## Configuration
 
@@ -39,6 +39,7 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `policies_yaml` | Conditionally | Inline Cloud Custodian policy YAML. Preferred over `policies_path` when both are set. |
 | `policies_path` | Conditionally | Local path, `file://`, `http://`, or `https://` location for policy YAML. Used when `policies_yaml` is empty. |
 | `custodian_binary` | No | Path/name of Cloud Custodian executable. Default: `custodian`. |
+| `aws_regions` | No | Comma or whitespace separated AWS regions passed as repeated `--region` flags. Duplicate entries are removed while preserving order. Default: unset, which falls back to `--region all` for AWS checks. |
 | `check_timeout_seconds` | No | Per-check timeout in seconds. Default: `300`. |
 | `policy_labels` | No | JSON map of labels merged into generated evidence labels. |
 | `resource_identity_fields` | No | JSON object mapping Cloud Custodian resource types to ordered identity field paths. Built-in defaults are used after configured fields. Example: `{"aws.ec2":["InstanceId","Arn"]}`. |

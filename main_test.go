@@ -390,6 +390,57 @@ printf '[{"id":"abc"}]' > "$out/test-policy/resources.json"
 		}
 	})
 
+	t.Run("passes configured aws regions without all fallback", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		t.Setenv("ARGS_FILE", argsFile)
+
+		script := `#!/bin/sh
+set -eu
+echo "$@" > "$ARGS_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.s3",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.s3"},
+			},
+			Timeout:    5 * time.Second,
+			OutputDir:  filepath.Join(t.TempDir(), "out"),
+			AWSRegions: []string{"us-east-1", "eu-west-1"},
+		})
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+
+		argsContent, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("failed to read args capture file: %v", err)
+		}
+		argsStr := string(argsContent)
+		if !strings.Contains(argsStr, "--region us-east-1 --region eu-west-1") {
+			t.Fatalf("expected configured aws region args, got: %s", argsStr)
+		}
+		if strings.Contains(argsStr, "--region all") {
+			t.Fatalf("did not expect all-region fallback when aws regions are configured, got: %s", argsStr)
+		}
+	})
+
 	t.Run("timeout cancellation", func(t *testing.T) {
 		script := `#!/bin/sh
 sleep 2
