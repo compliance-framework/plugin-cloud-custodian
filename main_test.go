@@ -58,6 +58,8 @@ func TestPluginConfigParse(t *testing.T) {
 		cfg := &PluginConfig{
 			PoliciesPath:        "/tmp/policies.yaml",
 			CustodianBinary:     "custom-custodian",
+			CustodianDebug:      "true",
+			CustodianVerbose:    "true",
 			CheckTimeoutSeconds: "45",
 			AWSRegions:          "us-east-1, eu-west-1 us-east-1",
 		}
@@ -73,6 +75,12 @@ func TestPluginConfigParse(t *testing.T) {
 		}
 		if parsed.CustodianBinary != "/usr/local/bin/custom-custodian" {
 			t.Fatalf("unexpected resolved binary: %s", parsed.CustodianBinary)
+		}
+		if !parsed.CustodianDebug {
+			t.Fatalf("expected custodian debug to be enabled")
+		}
+		if !parsed.CustodianVerbose {
+			t.Fatalf("expected custodian verbose to be enabled")
 		}
 		if len(parsed.AWSRegions) != 2 || parsed.AWSRegions[0] != "us-east-1" || parsed.AWSRegions[1] != "eu-west-1" {
 			t.Fatalf("unexpected aws regions: %#v", parsed.AWSRegions)
@@ -145,6 +153,20 @@ func TestPluginConfigParse(t *testing.T) {
 		_, err := (&PluginConfig{PoliciesYAML: "x", DebugDumpPayloads: "not-bool"}).Parse()
 		if err == nil {
 			t.Fatalf("expected error for invalid debug_dump_payloads")
+		}
+	})
+
+	t.Run("reject invalid custodian debug boolean", func(t *testing.T) {
+		_, err := (&PluginConfig{PoliciesYAML: "x", CustodianDebug: "not-bool"}).Parse()
+		if err == nil {
+			t.Fatalf("expected error for invalid custodian_debug")
+		}
+	})
+
+	t.Run("reject invalid custodian verbose boolean", func(t *testing.T) {
+		_, err := (&PluginConfig{PoliciesYAML: "x", CustodianVerbose: "not-bool"}).Parse()
+		if err == nil {
+			t.Fatalf("expected error for invalid custodian_verbose")
 		}
 	})
 
@@ -438,6 +460,55 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 		if strings.Contains(argsStr, "--region all") {
 			t.Fatalf("did not expect all-region fallback when aws regions are configured, got: %s", argsStr)
+		}
+	})
+
+	t.Run("passes debug and verbose args", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		t.Setenv("ARGS_FILE", argsFile)
+
+		script := `#!/bin/sh
+set -eu
+echo "$@" > "$ARGS_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.s3",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.s3"},
+			},
+			Timeout:   5 * time.Second,
+			OutputDir: filepath.Join(t.TempDir(), "out"),
+			Debug:     true,
+			Verbose:   true,
+		})
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+
+		argsContent, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("failed to read args capture file: %v", err)
+		}
+		argsStr := string(argsContent)
+		if !strings.Contains(argsStr, "run --debug -v --dryrun -s") {
+			t.Fatalf("expected debug and verbose args before dry-run args, got: %s", argsStr)
 		}
 	})
 
@@ -1016,6 +1087,110 @@ func TestBuildResourceRecordCanonicalizesHostedZoneARN(t *testing.T) {
 	}
 	if record.IdentityFields["arn"] != expected {
 		t.Fatalf("expected identity fields to include synthesized arn, got %#v", record.IdentityFields)
+	}
+}
+
+func TestAWSResourceExplorerURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  *StandardizedResourcePayload
+		want     string
+		wantLink bool
+	}{
+		{
+			name: "regional aws arn uses arn region",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "arn:aws:ec2:eu-west-1:123456789012:instance/i-123",
+					Provider: "aws",
+					Region:   "us-east-1",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=eu-west-1#/search?query=id%3Aarn%3Aaws%3Aec2%3Aeu-west-1%3A123456789012%3Ainstance%2Fi-123",
+			wantLink: true,
+		},
+		{
+			name: "global aws arn falls back to us east 1",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "arn:aws:iam::123456789012:role/example",
+					Provider: "aws",
+					Region:   "global",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-east-1#/search?query=id%3Aarn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fexample",
+			wantLink: true,
+		},
+		{
+			name: "non arn resource id has no resource explorer link",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "bucket-name",
+					Provider: "aws",
+					Region:   "us-east-1",
+				},
+			},
+		},
+		{
+			name: "non aws provider has no resource explorer link",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "arn:azure:example",
+					Provider: "azure",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := awsResourceExplorerURL(tt.payload)
+			if got != tt.want {
+				t.Fatalf("expected url %q, got %q", tt.want, got)
+			}
+
+			evidences := []*proto.Evidence{
+				{
+					UUID: "existing-link",
+					Links: []*proto.Link{
+						{
+							Href: "https://example.com/evidence",
+						},
+					},
+				},
+				nil,
+				{UUID: "empty-links"},
+			}
+			addResourceExplorerLinkToEvidence(evidences, tt.payload)
+
+			hasExplorerLink := false
+			for _, link := range evidences[0].Links {
+				if link.GetText() == "Open in AWS Resource Explorer" {
+					hasExplorerLink = true
+					if link.Href != tt.want {
+						t.Fatalf("expected resource explorer link %q, got %q", tt.want, link.Href)
+					}
+				}
+			}
+			if hasExplorerLink != tt.wantLink {
+				t.Fatalf("expected resource explorer link presence %t, got %t in %#v", tt.wantLink, hasExplorerLink, evidences[0].Links)
+			}
+			if tt.wantLink {
+				if len(evidences[0].Links) != 2 {
+					t.Fatalf("expected resource explorer link to append after existing evidence link, got %#v", evidences[0].Links)
+				}
+				if len(evidences[2].Links) != 1 || evidences[2].Links[0].Href != tt.want {
+					t.Fatalf("expected resource explorer link on evidence with no existing links, got %#v", evidences[2].Links)
+				}
+			} else {
+				if len(evidences[0].Links) != 1 {
+					t.Fatalf("expected non-aws/non-arn payload to preserve existing links only, got %#v", evidences[0].Links)
+				}
+				if len(evidences[2].Links) != 0 {
+					t.Fatalf("expected non-aws/non-arn payload not to add links, got %#v", evidences[2].Links)
+				}
+			}
+		})
 	}
 }
 

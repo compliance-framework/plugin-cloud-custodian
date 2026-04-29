@@ -39,6 +39,8 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `policies_yaml` | Conditionally | Inline Cloud Custodian policy YAML. Preferred over `policies_path` when both are set. |
 | `policies_path` | Conditionally | Local path, `file://`, `http://`, or `https://` location for policy YAML. Used when `policies_yaml` is empty. |
 | `custodian_binary` | No | Path/name of Cloud Custodian executable. Default: `custodian`. |
+| `custodian_debug` | No | Boolean (`true`/`false`) toggle to pass `--debug` to Cloud Custodian. This increases Cloud Custodian diagnostic output on stderr. Default: `false`. |
+| `custodian_verbose` | No | Boolean (`true`/`false`) toggle to pass `-v` to Cloud Custodian. This increases Cloud Custodian diagnostic output on stderr. Default: `false`. |
 | `aws_regions` | No | Comma or whitespace separated AWS regions passed as repeated `--region` flags. Duplicate entries are removed while preserving order. Default: unset, which falls back to `--region all` for AWS checks. |
 | `check_timeout_seconds` | No | Per-check timeout in seconds. Default: `300`. |
 | `policy_labels` | No | JSON map of labels merged into generated evidence labels. |
@@ -144,9 +146,11 @@ Each resource/check iteration produces one payload with this shape:
 ```
 
 Generated evidence labels include `resource_id`, `resource_type`, `provider`,
-and any available `account_id`/`region`. The resource subject also includes the
-resource identifier as a link and a `resource_id` property. AWS Route53 hosted
-zone identifiers such as `/hostedzone/Z123` are normalized to full ARNs such as
+and any available `account_id`/`region`. The resource subject includes the
+resource identifier as a link and a `resource_id` property. When the AWS
+resource identifier is an ARN, generated evidence includes an AWS Resource
+Explorer link using an exact `id:<arn>` search. AWS Route53 hosted zone
+identifiers such as `/hostedzone/Z123` are normalized to full ARNs such as
 `arn:aws:route53:::hostedzone/Z123`.
 
 `assessment.inventory_status` is `baseline` for resources found in the unfiltered

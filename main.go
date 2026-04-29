@@ -50,6 +50,8 @@ type PluginConfig struct {
 	PoliciesYAML           string `mapstructure:"policies_yaml"`
 	PoliciesPath           string `mapstructure:"policies_path"`
 	CustodianBinary        string `mapstructure:"custodian_binary"`
+	CustodianDebug         string `mapstructure:"custodian_debug"`
+	CustodianVerbose       string `mapstructure:"custodian_verbose"`
 	AWSRegions             string `mapstructure:"aws_regions"`
 	PolicyLabels           string `mapstructure:"policy_labels"`
 	ResourceIdentityFields string `mapstructure:"resource_identity_fields"`
@@ -63,6 +65,8 @@ type ParsedConfig struct {
 	PoliciesYAML           string
 	PoliciesPath           string
 	CustodianBinary        string
+	CustodianDebug         bool
+	CustodianVerbose       bool
 	AWSRegions             []string
 	PolicyLabels           map[string]string
 	ResourceIdentityFields map[string][]string
@@ -139,6 +143,24 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 
 	awsRegions := parseDelimitedList(c.AWSRegions)
 
+	custodianDebug := false
+	if strings.TrimSpace(c.CustodianDebug) != "" {
+		parsedDebug, err := strconv.ParseBool(c.CustodianDebug)
+		if err != nil {
+			return nil, fmt.Errorf("custodian_debug must be a boolean value: %w", err)
+		}
+		custodianDebug = parsedDebug
+	}
+
+	custodianVerbose := false
+	if strings.TrimSpace(c.CustodianVerbose) != "" {
+		parsedVerbose, err := strconv.ParseBool(c.CustodianVerbose)
+		if err != nil {
+			return nil, fmt.Errorf("custodian_verbose must be a boolean value: %w", err)
+		}
+		custodianVerbose = parsedVerbose
+	}
+
 	debugDumpPayloads := false
 	if strings.TrimSpace(c.DebugDumpPayloads) != "" {
 		parsedDebug, err := strconv.ParseBool(c.DebugDumpPayloads)
@@ -160,6 +182,8 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		PoliciesYAML:           inlineYAML,
 		PoliciesPath:           policiesPath,
 		CustodianBinary:        resolvedBinary,
+		CustodianDebug:         custodianDebug,
+		CustodianVerbose:       custodianVerbose,
 		AWSRegions:             awsRegions,
 		PolicyLabels:           policyLabels,
 		ResourceIdentityFields: resourceIdentityFields,
@@ -192,6 +216,8 @@ type CustodianExecutionRequest struct {
 	Check      CustodianCheck
 	Timeout    time.Duration
 	OutputDir  string
+	Debug      bool
+	Verbose    bool
 	AWSRegions []string
 }
 
@@ -324,7 +350,14 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	runCtx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 
-	args := []string{"run", "--dryrun", "-s", req.OutputDir, policyPath}
+	args := []string{"run"}
+	if req.Debug {
+		args = append(args, "--debug")
+	}
+	if req.Verbose {
+		args = append(args, "-v")
+	}
+	args = append(args, "--dryrun", "-s", req.OutputDir, policyPath)
 	if strings.EqualFold(req.Check.Provider, "aws") {
 		// Ensure AWS policies evaluate across all regions by default while
 		// allowing operators to narrow problematic service/region scans.
@@ -1491,6 +1524,8 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			Check:      check,
 			Timeout:    p.parsedConfig.CheckTimeout,
 			OutputDir:  checkDir,
+			Debug:      p.parsedConfig.CustodianDebug,
+			Verbose:    p.parsedConfig.CustodianVerbose,
 			AWSRegions: p.parsedConfig.AWSRegions,
 		})
 		if execution.Err != nil || execution.Error != "" {
@@ -1610,6 +1645,8 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 			Check:      check,
 			Timeout:    p.parsedConfig.CheckTimeout,
 			OutputDir:  outputDir,
+			Debug:      p.parsedConfig.CustodianDebug,
+			Verbose:    p.parsedConfig.CustodianVerbose,
 			AWSRegions: p.parsedConfig.AWSRegions,
 		})
 
@@ -1889,6 +1926,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 			activities,
 			payload,
 		)
+		addResourceExplorerLinkToEvidence(evidences, payload)
 		allEvidences = append(allEvidences, evidences...)
 		if err != nil {
 			p.Logger.Warn("Policy path evaluation failed for resource",
@@ -1917,6 +1955,59 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 		"had_errors", accumulatedErrors != nil,
 	)
 	return allEvidences, accumulatedErrors, successfulRuns
+}
+
+func addResourceExplorerLinkToEvidence(evidences []*proto.Evidence, payload *StandardizedResourcePayload) {
+	link := awsResourceExplorerLink(payload)
+	if link == nil {
+		return
+	}
+	for _, evidence := range evidences {
+		if evidence == nil {
+			continue
+		}
+		evidence.Links = append(evidence.Links, &proto.Link{
+			Href: link.Href,
+			Rel:  link.Rel,
+			Text: link.Text,
+		})
+	}
+}
+
+func awsResourceExplorerLink(payload *StandardizedResourcePayload) *proto.Link {
+	if href := awsResourceExplorerURL(payload); href != "" {
+		return &proto.Link{
+			Href: href,
+			Rel:  policyManager.Pointer("reference"),
+			Text: policyManager.Pointer("Open in AWS Resource Explorer"),
+		}
+	}
+	return nil
+}
+
+func awsResourceExplorerURL(payload *StandardizedResourcePayload) string {
+	if payload == nil || !strings.EqualFold(payload.Resource.Provider, "aws") || !strings.HasPrefix(payload.Resource.ID, "arn:") {
+		return ""
+	}
+
+	region := awsRegionFromARN(payload.Resource.ID)
+	if region == "" && payload.Resource.Region != "" && payload.Resource.Region != "global" {
+		region = payload.Resource.Region
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	query := "id:" + payload.Resource.ID
+	return "https://console.aws.amazon.com/resource-explorer/home?region=" + url.QueryEscape(region) + "#/search?query=" + url.QueryEscape(query)
+}
+
+func awsRegionFromARN(arn string) string {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) < 6 {
+		return ""
+	}
+	return strings.TrimSpace(parts[3])
 }
 
 func resourcePolicyLabels(policyLabels map[string]string) map[string]string {
