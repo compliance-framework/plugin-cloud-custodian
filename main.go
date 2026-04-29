@@ -173,17 +173,7 @@ func parseDelimitedList(value string) []string {
 	parts := strings.FieldsFunc(value, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == '\r'
 	})
-	items := make([]string, 0, len(parts))
-	seen := map[string]bool{}
-	for _, part := range parts {
-		item := strings.TrimSpace(part)
-		if item == "" || seen[item] {
-			continue
-		}
-		items = append(items, item)
-		seen[item] = true
-	}
-	return items
+	return compactUniqueStrings(parts)
 }
 
 // CustodianCheck represents a single Cloud Custodian policy entry used as one check iteration.
