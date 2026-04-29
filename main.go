@@ -50,6 +50,7 @@ type PluginConfig struct {
 	PoliciesYAML           string `mapstructure:"policies_yaml"`
 	PoliciesPath           string `mapstructure:"policies_path"`
 	CustodianBinary        string `mapstructure:"custodian_binary"`
+	AWSRegions             string `mapstructure:"aws_regions"`
 	PolicyLabels           string `mapstructure:"policy_labels"`
 	ResourceIdentityFields string `mapstructure:"resource_identity_fields"`
 	CheckTimeoutSeconds    string `mapstructure:"check_timeout_seconds"`
@@ -62,6 +63,7 @@ type ParsedConfig struct {
 	PoliciesYAML           string
 	PoliciesPath           string
 	CustodianBinary        string
+	AWSRegions             []string
 	PolicyLabels           map[string]string
 	ResourceIdentityFields map[string][]string
 	CheckTimeout           time.Duration
@@ -135,6 +137,8 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		return nil, fmt.Errorf("could not resolve custodian binary %q: %w", binary, err)
 	}
 
+	awsRegions := parseDelimitedList(c.AWSRegions)
+
 	debugDumpPayloads := false
 	if strings.TrimSpace(c.DebugDumpPayloads) != "" {
 		parsedDebug, err := strconv.ParseBool(c.DebugDumpPayloads)
@@ -156,12 +160,20 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		PoliciesYAML:           inlineYAML,
 		PoliciesPath:           policiesPath,
 		CustodianBinary:        resolvedBinary,
+		AWSRegions:             awsRegions,
 		PolicyLabels:           policyLabels,
 		ResourceIdentityFields: resourceIdentityFields,
 		CheckTimeout:           time.Duration(checkTimeoutSeconds) * time.Second,
 		DebugDumpPayloads:      debugDumpPayloads,
 		DebugPayloadOutputDir:  debugPayloadOutputDir,
 	}, nil
+}
+
+func parseDelimitedList(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == '\r'
+	})
+	return compactUniqueStrings(parts)
 }
 
 // CustodianCheck represents a single Cloud Custodian policy entry used as one check iteration.
@@ -180,6 +192,7 @@ type CustodianExecutionRequest struct {
 	Check      CustodianCheck
 	Timeout    time.Duration
 	OutputDir  string
+	AWSRegions []string
 }
 
 // CustodianExecutionResult captures runtime output and artifacts from one check run.
@@ -264,6 +277,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		"binary", req.BinaryPath,
 		"timeout", req.Timeout.String(),
 		"output_dir", req.OutputDir,
+		"aws_regions", req.AWSRegions,
 	)
 	result := CustodianExecutionResult{
 		StartedAt:    time.Now().UTC(),
@@ -312,8 +326,15 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 
 	args := []string{"run", "--dryrun", "-s", req.OutputDir, policyPath}
 	if strings.EqualFold(req.Check.Provider, "aws") {
-		// Ensure AWS policies evaluate across all regions by default.
-		args = append(args, "--region", "all")
+		// Ensure AWS policies evaluate across all regions by default while
+		// allowing operators to narrow problematic service/region scans.
+		regions := req.AWSRegions
+		if len(regions) == 0 {
+			regions = []string{"all"}
+		}
+		for _, region := range regions {
+			args = append(args, "--region", region)
+		}
 	}
 	cmd := exec.CommandContext(runCtx, req.BinaryPath, args...)
 	e.Logger.Debug("Executing custodian command",
@@ -1270,6 +1291,7 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 		"has_inline_policies_yaml", strings.TrimSpace(parsed.PoliciesYAML) != "",
 		"policies_path", parsed.PoliciesPath,
 		"custodian_binary", parsed.CustodianBinary,
+		"aws_regions", parsed.AWSRegions,
 		"check_timeout", parsed.CheckTimeout.String(),
 		"policy_labels", parsed.PolicyLabels,
 		"debug_dump_payloads", parsed.DebugDumpPayloads,
@@ -1469,6 +1491,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			Check:      check,
 			Timeout:    p.parsedConfig.CheckTimeout,
 			OutputDir:  checkDir,
+			AWSRegions: p.parsedConfig.AWSRegions,
 		})
 		if execution.Err != nil || execution.Error != "" {
 			err := formatExecutionFailure(check.Name, execution)
@@ -1587,6 +1610,7 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 			Check:      check,
 			Timeout:    p.parsedConfig.CheckTimeout,
 			OutputDir:  outputDir,
+			AWSRegions: p.parsedConfig.AWSRegions,
 		})
 
 		var baselineErr error

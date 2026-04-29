@@ -55,7 +55,12 @@ func TestPluginConfigParse(t *testing.T) {
 	})
 
 	t.Run("path only", func(t *testing.T) {
-		cfg := &PluginConfig{PoliciesPath: "/tmp/policies.yaml", CustodianBinary: "custom-custodian", CheckTimeoutSeconds: "45"}
+		cfg := &PluginConfig{
+			PoliciesPath:        "/tmp/policies.yaml",
+			CustodianBinary:     "custom-custodian",
+			CheckTimeoutSeconds: "45",
+			AWSRegions:          "us-east-1, eu-west-1 us-east-1",
+		}
 		parsed, err := cfg.Parse()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -68,6 +73,9 @@ func TestPluginConfigParse(t *testing.T) {
 		}
 		if parsed.CustodianBinary != "/usr/local/bin/custom-custodian" {
 			t.Fatalf("unexpected resolved binary: %s", parsed.CustodianBinary)
+		}
+		if len(parsed.AWSRegions) != 2 || parsed.AWSRegions[0] != "us-east-1" || parsed.AWSRegions[1] != "eu-west-1" {
+			t.Fatalf("unexpected aws regions: %#v", parsed.AWSRegions)
 		}
 	})
 
@@ -379,6 +387,57 @@ printf '[{"id":"abc"}]' > "$out/test-policy/resources.json"
 		}
 		if !strings.Contains(argsStr, "--region all") {
 			t.Fatalf("expected aws region fanout args, got: %s", argsStr)
+		}
+	})
+
+	t.Run("passes configured aws regions without all fallback", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		t.Setenv("ARGS_FILE", argsFile)
+
+		script := `#!/bin/sh
+set -eu
+echo "$@" > "$ARGS_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.s3",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.s3"},
+			},
+			Timeout:    5 * time.Second,
+			OutputDir:  filepath.Join(t.TempDir(), "out"),
+			AWSRegions: []string{"us-east-1", "eu-west-1"},
+		})
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+
+		argsContent, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("failed to read args capture file: %v", err)
+		}
+		argsStr := string(argsContent)
+		if !strings.Contains(argsStr, "--region us-east-1 --region eu-west-1") {
+			t.Fatalf("expected configured aws region args, got: %s", argsStr)
+		}
+		if strings.Contains(argsStr, "--region all") {
+			t.Fatalf("did not expect all-region fallback when aws regions are configured, got: %s", argsStr)
 		}
 	})
 
