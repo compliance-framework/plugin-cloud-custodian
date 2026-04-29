@@ -55,7 +55,12 @@ func TestPluginConfigParse(t *testing.T) {
 	})
 
 	t.Run("path only", func(t *testing.T) {
-		cfg := &PluginConfig{PoliciesPath: "/tmp/policies.yaml", CustodianBinary: "custom-custodian", CheckTimeoutSeconds: "45"}
+		cfg := &PluginConfig{
+			PoliciesPath:        "/tmp/policies.yaml",
+			CustodianBinary:     "custom-custodian",
+			CheckTimeoutSeconds: "45",
+			AWSRegions:          "us-east-1, eu-west-1 us-east-1",
+		}
 		parsed, err := cfg.Parse()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -68,6 +73,9 @@ func TestPluginConfigParse(t *testing.T) {
 		}
 		if parsed.CustodianBinary != "/usr/local/bin/custom-custodian" {
 			t.Fatalf("unexpected resolved binary: %s", parsed.CustodianBinary)
+		}
+		if len(parsed.AWSRegions) != 2 || parsed.AWSRegions[0] != "us-east-1" || parsed.AWSRegions[1] != "eu-west-1" {
+			t.Fatalf("unexpected aws regions: %#v", parsed.AWSRegions)
 		}
 	})
 
