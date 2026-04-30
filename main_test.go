@@ -797,6 +797,13 @@ printf '[]' > "$out/test-policy/resources.json"
 		if lines[1] != filepath.Join(outDir, "custodian-aws-api-trace.jsonl") {
 			t.Fatalf("unexpected trace log path: %s", lines[1])
 		}
+		traceLogInfo, err := os.Stat(lines[1])
+		if err != nil {
+			t.Fatalf("expected trace log file to be created: %v", err)
+		}
+		if traceLogInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("expected trace log permissions 0600, got %v", traceLogInfo.Mode().Perm())
+		}
 		if lines[2] != "1" {
 			t.Fatalf("expected PYTHONUNBUFFERED=1, got %s", lines[2])
 		}

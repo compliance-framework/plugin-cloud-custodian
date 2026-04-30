@@ -674,6 +674,16 @@ func setupCustodianAWSAPITrace(outputDir string) (string, string, error) {
 		return "", "", err
 	}
 	traceLogPath := filepath.Join(outputDir, "custodian-aws-api-trace.jsonl")
+	traceLog, err := os.OpenFile(traceLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", "", err
+	}
+	if err := traceLog.Close(); err != nil {
+		return "", "", err
+	}
+	if err := os.Chmod(traceLogPath, 0o600); err != nil {
+		return "", "", err
+	}
 	siteCustomizePath := filepath.Join(traceDir, "sitecustomize.py")
 	siteCustomize := `import json
 import os
