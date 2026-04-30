@@ -75,15 +75,15 @@ func TestPluginConfigParse(t *testing.T) {
 		cfg := &PluginConfig{
 			PoliciesPath:                        "/tmp/policies.yaml",
 			CustodianBinary:                     "custom-custodian",
-			CustodianDebug:                      "true",
-			CustodianVerbose:                    "true",
-			CustodianAWSAPITrace:                "true",
-			CustodianNetworkDiag:                "true",
+			CustodianDebug:                      " true ",
+			CustodianVerbose:                    " true ",
+			CustodianAWSAPITrace:                " true ",
+			CustodianNetworkDiag:                " true ",
 			CustodianNetworkDiagnosticEndpoints: "https://vpce-123.backup.eu-west-1.vpce.amazonaws.com, vpce-456.ec2.eu-west-1.vpce.amazonaws.com",
-			CustodianLogTail:                    "true",
+			CustodianLogTail:                    " true ",
 			CheckTimeoutSeconds:                 "45",
 			AWSRegions:                          "us-east-1, eu-west-1 us-east-1",
-			PreserveArtifacts:                   "true",
+			PreserveArtifacts:                   " true ",
 		}
 		parsed, err := cfg.Parse()
 		if err != nil {
@@ -1080,6 +1080,22 @@ func TestDiagnosticHelpers(t *testing.T) {
 			if strings.Contains(host, "iam.eu-west-1") || strings.Contains(host, "iam.us-east-1") {
 				t.Fatalf("did not expect regional IAM endpoint host: %#v", hosts)
 			}
+		}
+	})
+
+	t.Run("uses china endpoint suffix for china regions", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.iam-role", []string{"cn-north-1"})
+		if !known {
+			t.Fatalf("expected iam-role to be mapped")
+		}
+		want := []string{
+			"sts.cn-north-1.amazonaws.com.cn",
+			"ec2.cn-north-1.amazonaws.com.cn",
+			"tagging.cn-north-1.amazonaws.com.cn",
+			"iam.amazonaws.com.cn",
+		}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") {
+			t.Fatalf("unexpected china hosts: %#v", hosts)
 		}
 	})
 

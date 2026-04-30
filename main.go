@@ -260,7 +260,8 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 }
 
 func parseOptionalBool(name, value string) (bool, error) {
-	if strings.TrimSpace(value) == "" {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return false, nil
 	}
 	parsed, err := strconv.ParseBool(value)
@@ -871,10 +872,23 @@ func awsDiagnosticEndpointsForCheck(resource string, regions []string, configure
 
 func awsServiceEndpointHost(service string, region string) string {
 	service = strings.TrimSpace(service)
+	region = strings.TrimSpace(region)
+	partition := awsPartitionForRegion(region)
+	dnsSuffix := awsEndpointDNSSuffixForPartition(partition)
+	if _, ok := awsGlobalEndpointServices[service]; ok && partition == "aws-cn" {
+		return fmt.Sprintf("%s.%s", service, dnsSuffix)
+	}
 	if host, ok := awsGlobalEndpointServices[service]; ok {
 		return host
 	}
-	return fmt.Sprintf("%s.%s.amazonaws.com", service, strings.TrimSpace(region))
+	return fmt.Sprintf("%s.%s.%s", service, region, dnsSuffix)
+}
+
+func awsEndpointDNSSuffixForPartition(partition string) string {
+	if partition == "aws-cn" {
+		return "amazonaws.com.cn"
+	}
+	return "amazonaws.com"
 }
 
 func parseNetworkDiagnosticEndpoint(value string) (networkDiagnosticEndpoint, error) {
