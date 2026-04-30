@@ -883,6 +883,32 @@ exit 3
 		}
 	})
 
+	t.Run("limits custodian log artifact tails", func(t *testing.T) {
+		root := t.TempDir()
+		logPaths := make([]string, 0, custodianLogTailMaxSections+2)
+		for i := 0; i < custodianLogTailMaxSections+2; i++ {
+			logPath := filepath.Join(root, fmt.Sprintf("log-%02d", i), "custodian-run.log")
+			if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+				t.Fatalf("failed to create log dir: %v", err)
+			}
+			if err := os.WriteFile(logPath, []byte(fmt.Sprintf("log detail %02d", i)), 0o600); err != nil {
+				t.Fatalf("failed to write log: %v", err)
+			}
+			logPaths = append(logPaths, logPath)
+		}
+
+		_, logTail, err := readCustodianLogArtifactsForPaths(logPaths, custodianOutputTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected log tail error: %v", err)
+		}
+		if got := strings.Count(logTail, "custodian log tail from"); got != custodianLogTailMaxSections {
+			t.Fatalf("expected %d log sections, got %d in:\n%s", custodianLogTailMaxSections, got, logTail)
+		}
+		if !strings.Contains(logTail, "2 additional custodian-run.log file(s) omitted") {
+			t.Fatalf("expected truncation marker, got:\n%s", logTail)
+		}
+	})
+
 	t.Run("does not read custodian log artifacts on success by default", func(t *testing.T) {
 		script := `#!/bin/sh
 set -eu
@@ -970,6 +996,16 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 		if len(logPaths) != 0 {
 			t.Fatalf("expected symlinked custodian logs to be ignored, got %#v", logPaths)
+		}
+	})
+
+	t.Run("treats missing proc fd directory as empty socket snapshot", func(t *testing.T) {
+		inodes, err := processSocketInodes(-1)
+		if err != nil {
+			t.Fatalf("expected missing process fd directory to be non-fatal, got %v", err)
+		}
+		if len(inodes) != 0 {
+			t.Fatalf("expected no socket inodes for missing process, got %#v", inodes)
 		}
 	})
 
@@ -1828,7 +1864,7 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 					Region:   "cn-north-1",
 				},
 			},
-			want:     "https://console.aws.amazon.com/resource-explorer/home?region=cn-north-1#/search?query=id%3Aarn%3Aaws-cn%3As3%3A%3A%3Aexample-bucket",
+			want:     "https://console.amazonaws.cn/resource-explorer/home?region=cn-north-1#/search?query=id%3Aarn%3Aaws-cn%3As3%3A%3A%3Aexample-bucket",
 			wantLink: true,
 		},
 		{
@@ -1841,7 +1877,7 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 					Region:   "us-gov-west-1",
 				},
 			},
-			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-gov-west-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
+			want:     "https://console.amazonaws-us-gov.com/resource-explorer/home?region=us-gov-west-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
 			wantLink: true,
 		},
 		{
@@ -1855,7 +1891,7 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 					Region:    "us-east-1",
 				},
 			},
-			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-east-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
+			want:     "https://console.amazonaws-us-gov.com/resource-explorer/home?region=us-gov-west-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
 			wantLink: true,
 		},
 		{

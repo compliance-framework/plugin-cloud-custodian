@@ -44,6 +44,7 @@ const (
 	nonComplianceMessageField   = "non_compliance_message"
 	custodianWatchInterval      = 30 * time.Second
 	custodianOutputTailBytes    = 4096
+	custodianLogTailMaxSections = 5
 )
 
 var lookPath = exec.LookPath
@@ -1116,12 +1117,18 @@ func processSocketInodes(pid int) (map[string]bool, error) {
 	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
 	entries, err := os.ReadDir(fdDir)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
+			return map[string]bool{}, nil
+		}
 		return nil, err
 	}
 	inodes := map[string]bool{}
 	for _, entry := range entries {
 		target, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			continue
 		}
 		if strings.HasPrefix(target, "socket:[") && strings.HasSuffix(target, "]") {
@@ -1255,8 +1262,13 @@ func readCustodianLogArtifactsForPaths(logPaths []string, maxBytes int) ([]strin
 		return nil, "", nil
 	}
 
-	sections := make([]string, 0, len(logPaths))
-	for _, logPath := range logPaths {
+	sections := make([]string, 0, min(len(logPaths), custodianLogTailMaxSections))
+	for i, logPath := range logPaths {
+		if i >= custodianLogTailMaxSections {
+			remaining := len(logPaths) - custodianLogTailMaxSections
+			sections = append(sections, fmt.Sprintf("custodian log tail truncated: %d additional custodian-run.log file(s) omitted", remaining))
+			break
+		}
 		content, err := readFileTail(logPath, maxBytes)
 		if err != nil {
 			return logPaths, "", fmt.Errorf("failed to read custodian log %s: %w", logPath, err)
@@ -2828,16 +2840,18 @@ func awsResourceExplorerURLWithReason(payload *StandardizedResourcePayload) (str
 		return "", reason
 	}
 
+	partition := awsPartitionFromARN(resourceARN)
 	region := awsRegionFromARN(resourceARN)
-	if region == "" && payload.Resource.Region != "" && payload.Resource.Region != "global" {
+	if region == "" && payload.Resource.Region != "" && payload.Resource.Region != "global" && awsPartitionForRegion(payload.Resource.Region) == partition {
 		region = payload.Resource.Region
 	}
 	if region == "" {
-		region = "us-east-1"
+		region = awsDefaultConsoleRegionForPartition(partition)
 	}
 
 	query := "id:" + resourceARN
-	return "https://console.aws.amazon.com/resource-explorer/home?region=" + url.QueryEscape(region) + "#/search?query=" + url.QueryEscape(query), ""
+	consoleDomain := awsConsoleDomainForPartition(partition)
+	return "https://" + consoleDomain + "/resource-explorer/home?region=" + url.QueryEscape(region) + "#/search?query=" + url.QueryEscape(query), ""
 }
 
 func awsResourceExplorerResourceARN(payload *StandardizedResourcePayload) (string, string) {
@@ -2878,6 +2892,28 @@ func awsPartitionFromARN(arnValue string) string {
 		return strings.TrimSpace(parts[1])
 	}
 	return ""
+}
+
+func awsConsoleDomainForPartition(partition string) string {
+	switch partition {
+	case "aws-cn":
+		return "console.amazonaws.cn"
+	case "aws-us-gov":
+		return "console.amazonaws-us-gov.com"
+	default:
+		return "console.aws.amazon.com"
+	}
+}
+
+func awsDefaultConsoleRegionForPartition(partition string) string {
+	switch partition {
+	case "aws-cn":
+		return "cn-north-1"
+	case "aws-us-gov":
+		return "us-gov-west-1"
+	default:
+		return "us-east-1"
+	}
 }
 
 func awsPartitionForRegion(region string) string {
