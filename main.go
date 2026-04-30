@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -565,8 +566,14 @@ commandFinished:
 	if resources != nil {
 		result.Resources = resources
 	}
-	logPaths, logTail, logErr := readCustodianLogArtifacts(req.OutputDir, custodianOutputTailBytes)
-	result.LogPaths = logPaths
+	var logTail string
+	var logErr error
+	if req.LogTailDuringRun || err != nil || runCtx.Err() != nil || resourcesErr != nil {
+		logPaths, tail, readErr := readCustodianLogArtifacts(req.OutputDir, custodianOutputTailBytes)
+		result.LogPaths = logPaths
+		logTail = tail
+		logErr = readErr
+	}
 
 	if err != nil {
 		result.Err = fmt.Errorf("custodian execution failed: %w", err)
@@ -728,7 +735,7 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		e.Logger.Error("AWS endpoint diagnostics configuration is invalid", "check_name", req.Check.Name, "resource", req.Check.Resource, "error", endpointErr)
 		return endpointErr
 	}
-	if !knownResource {
+	if !knownResource && len(endpoints) == 0 {
 		err := fmt.Errorf("resource service is not mapped for AWS endpoint diagnostics: %s", req.Check.Resource)
 		e.Logger.Error("AWS endpoint diagnostics failed before custodian execution", "check_name", req.Check.Name, "resource", req.Check.Resource, "error", err)
 		return err
@@ -737,6 +744,9 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		err := fmt.Errorf("no concrete AWS endpoint hosts are available for diagnostics; configure aws_regions or custodian_network_diagnostic_endpoints")
 		e.Logger.Error("AWS endpoint diagnostics failed before custodian execution", "check_name", req.Check.Name, "resource", req.Check.Resource, "aws_regions", req.AWSRegions, "error", err)
 		return err
+	}
+	if !knownResource {
+		e.Logger.Warn("AWS endpoint diagnostics will use only configured endpoints because resource service is not mapped", "check_name", req.Check.Name, "resource", req.Check.Resource)
 	}
 
 	var diagnosticsErr error
@@ -781,17 +791,16 @@ func awsEndpointHostsForCheck(resource string, regions []string) ([]string, bool
 
 func awsDiagnosticEndpointsForCheck(resource string, regions []string, configuredEndpoints []string) ([]networkDiagnosticEndpoint, bool, error) {
 	services, knownResource := awsServicesForResource(resource)
-	if !knownResource {
-		return nil, false, nil
-	}
-
 	endpoints := make([]networkDiagnosticEndpoint, 0)
 	for _, endpointValue := range configuredEndpoints {
 		endpoint, err := parseNetworkDiagnosticEndpoint(endpointValue)
 		if err != nil {
-			return nil, true, err
+			return nil, knownResource, err
 		}
 		endpoints = append(endpoints, endpoint)
+	}
+	if !knownResource {
+		return compactUniqueNetworkDiagnosticEndpoints(endpoints), false, nil
 	}
 
 	diagnosticRegions := make([]string, 0, len(regions))
@@ -854,7 +863,7 @@ func parseNetworkDiagnosticEndpoint(value string) (networkDiagnosticEndpoint, er
 
 func networkDiagnosticEndpointSource(host string) string {
 	host = strings.ToLower(strings.TrimSpace(host))
-	if strings.Contains(host, ".vpce.amazonaws.com") || strings.Contains(host, ".vpce.amazonaws.com.cn") {
+	if strings.HasSuffix(host, ".vpce.amazonaws.com") || strings.HasSuffix(host, ".vpce.amazonaws.com.cn") {
 		return "aws-vpc-endpoint"
 	}
 	return "configured"
@@ -976,6 +985,15 @@ func (e *CommandCustodianExecutor) logCustodianRunLogTail(outputDir, checkName, 
 }
 
 func custodianProcessSockets(pid int) ([]string, error) {
+	if runtime.GOOS != "linux" {
+		return []string{}, nil
+	}
+	if _, err := os.Stat("/proc"); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
 	inodes, err := processSocketInodes(pid)
 	if err != nil {
 		return nil, err
@@ -1057,6 +1075,16 @@ func decodeProcNetAddress(value string, ipv6 bool) string {
 		ipBytes, err := hex.DecodeString(parts[0])
 		if err == nil && len(ipBytes) == 4 {
 			return fmt.Sprintf("%d.%d.%d.%d:%d", ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0], port)
+		}
+	}
+	if ipv6 && len(parts[0]) == 32 {
+		ipBytes, err := hex.DecodeString(parts[0])
+		if err == nil && len(ipBytes) == net.IPv6len {
+			for index := 0; index < len(ipBytes); index += 4 {
+				ipBytes[index], ipBytes[index+3] = ipBytes[index+3], ipBytes[index]
+				ipBytes[index+1], ipBytes[index+2] = ipBytes[index+2], ipBytes[index+1]
+			}
+			return net.JoinHostPort(net.IP(ipBytes).String(), strconv.FormatUint(port, 10))
 		}
 	}
 	return fmt.Sprintf("%s:%d", parts[0], port)

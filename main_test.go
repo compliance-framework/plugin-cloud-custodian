@@ -566,6 +566,56 @@ touch "$EXECUTED_FILE"
 		}
 	})
 
+	t.Run("network diagnostics allow configured endpoints for unmapped resources", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				if endpoint.Host != "vpce-123.example.eu-west-1.vpce.amazonaws.com" {
+					t.Fatalf("unexpected endpoint host: %s", endpoint.Host)
+				}
+				return tlsProbeResult{RemoteAddr: "10.0.0.10:443", TLSVersion: "TLS1.3"}, nil
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.future-resource",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.future-resource"},
+			},
+			Timeout:                    5 * time.Second,
+			OutputDir:                  filepath.Join(t.TempDir(), "out"),
+			NetworkDiagnostics:         true,
+			NetworkDiagnosticEndpoints: []string{"vpce-123.example.eu-west-1.vpce.amazonaws.com"},
+		})
+
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+	})
+
 	t.Run("passes debug and verbose args", func(t *testing.T) {
 		argsFile := filepath.Join(t.TempDir(), "args.txt")
 		t.Setenv("ARGS_FILE", argsFile)
@@ -755,6 +805,45 @@ exit 3
 		}
 	})
 
+	t.Run("does not read custodian log artifacts on success by default", func(t *testing.T) {
+		script := `#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy/us-east-1/test-policy"
+printf 'success log detail\n' > "$out/test-policy/us-east-1/test-policy/custodian-run.log"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:   5 * time.Second,
+			OutputDir: filepath.Join(t.TempDir(), "out"),
+		})
+
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+		if len(result.LogPaths) != 0 {
+			t.Fatalf("expected successful execution not to walk log artifacts by default, got %#v", result.LogPaths)
+		}
+	})
+
 	t.Run("strips plugin-only policy fields before custodian execution", func(t *testing.T) {
 		script := `#!/bin/sh
 set -eu
@@ -891,6 +980,15 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("uses strict vpc endpoint suffix classification", func(t *testing.T) {
+		if got := networkDiagnosticEndpointSource("evil.vpce.amazonaws.com.attacker.com"); got != "configured" {
+			t.Fatalf("expected attacker suffix not to be classified as vpc endpoint, got %s", got)
+		}
+		if got := networkDiagnosticEndpointSource("vpce-123.backup.eu-west-1.vpce.amazonaws.com"); got != "aws-vpc-endpoint" {
+			t.Fatalf("expected vpc endpoint classification, got %s", got)
+		}
+	})
+
 	t.Run("rejects invalid configured endpoint ports", func(t *testing.T) {
 		_, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{"vpce-123.backup.eu-west-1.vpce.amazonaws.com:not-a-port"})
 		if err == nil {
@@ -905,6 +1003,19 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 		if len(hosts) != 0 {
 			t.Fatalf("expected no hosts for unknown resource, got %#v", hosts)
+		}
+	})
+
+	t.Run("allows configured endpoints for unknown resource types", func(t *testing.T) {
+		endpoints, known, err := awsDiagnosticEndpointsForCheck("aws.not-yet-mapped", []string{"eu-west-1"}, []string{"vpce-123.example.eu-west-1.vpce.amazonaws.com"})
+		if err != nil {
+			t.Fatalf("unexpected endpoint parse error: %v", err)
+		}
+		if known {
+			t.Fatalf("expected resource to remain unknown")
+		}
+		if len(endpoints) != 1 || endpoints[0].Host != "vpce-123.example.eu-west-1.vpce.amazonaws.com" {
+			t.Fatalf("expected configured endpoint for unknown resource, got %#v", endpoints)
 		}
 	})
 
@@ -954,6 +1065,10 @@ func TestDiagnosticHelpers(t *testing.T) {
 		got := decodeProcNetAddress("0100007F:01BB", false)
 		if got != "127.0.0.1:443" {
 			t.Fatalf("unexpected decoded address: %s", got)
+		}
+		got = decodeProcNetAddress("00000000000000000000000001000000:01BB", true)
+		if got != "[::1]:443" {
+			t.Fatalf("unexpected decoded IPv6 address: %s", got)
 		}
 	})
 
