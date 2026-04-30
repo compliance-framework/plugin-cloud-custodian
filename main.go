@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -44,35 +46,47 @@ const (
 )
 
 var lookPath = exec.LookPath
+var lookupHost = net.DefaultResolver.LookupHost
+var tlsProbeEndpoint = defaultTLSProbeEndpoint
 
 // PluginConfig receives string-only config from the agent gRPC interface.
 type PluginConfig struct {
-	PoliciesYAML           string `mapstructure:"policies_yaml"`
-	PoliciesPath           string `mapstructure:"policies_path"`
-	CustodianBinary        string `mapstructure:"custodian_binary"`
-	CustodianDebug         string `mapstructure:"custodian_debug"`
-	CustodianVerbose       string `mapstructure:"custodian_verbose"`
-	AWSRegions             string `mapstructure:"aws_regions"`
-	PolicyLabels           string `mapstructure:"policy_labels"`
-	ResourceIdentityFields string `mapstructure:"resource_identity_fields"`
-	CheckTimeoutSeconds    string `mapstructure:"check_timeout_seconds"`
-	DebugDumpPayloads      string `mapstructure:"debug_dump_payloads"`
-	DebugPayloadOutputDir  string `mapstructure:"debug_payload_output_dir"`
+	PoliciesYAML                        string `mapstructure:"policies_yaml"`
+	PoliciesPath                        string `mapstructure:"policies_path"`
+	CustodianBinary                     string `mapstructure:"custodian_binary"`
+	CustodianDebug                      string `mapstructure:"custodian_debug"`
+	CustodianVerbose                    string `mapstructure:"custodian_verbose"`
+	CustodianAWSAPITrace                string `mapstructure:"custodian_aws_api_trace"`
+	CustodianNetworkDiag                string `mapstructure:"custodian_network_diagnostics"`
+	CustodianNetworkDiagnosticEndpoints string `mapstructure:"custodian_network_diagnostic_endpoints"`
+	CustodianLogTail                    string `mapstructure:"custodian_log_tail_during_run"`
+	AWSRegions                          string `mapstructure:"aws_regions"`
+	PolicyLabels                        string `mapstructure:"policy_labels"`
+	ResourceIdentityFields              string `mapstructure:"resource_identity_fields"`
+	CheckTimeoutSeconds                 string `mapstructure:"check_timeout_seconds"`
+	DebugDumpPayloads                   string `mapstructure:"debug_dump_payloads"`
+	DebugPayloadOutputDir               string `mapstructure:"debug_payload_output_dir"`
+	PreserveArtifacts                   string `mapstructure:"preserve_execution_artifacts"`
 }
 
 // ParsedConfig stores normalized and validated values for runtime use.
 type ParsedConfig struct {
-	PoliciesYAML           string
-	PoliciesPath           string
-	CustodianBinary        string
-	CustodianDebug         bool
-	CustodianVerbose       bool
-	AWSRegions             []string
-	PolicyLabels           map[string]string
-	ResourceIdentityFields map[string][]string
-	CheckTimeout           time.Duration
-	DebugDumpPayloads      bool
-	DebugPayloadOutputDir  string
+	PoliciesYAML                        string
+	PoliciesPath                        string
+	CustodianBinary                     string
+	CustodianDebug                      bool
+	CustodianVerbose                    bool
+	CustodianAWSAPITrace                bool
+	CustodianNetworkDiag                bool
+	CustodianNetworkDiagnosticEndpoints []string
+	CustodianLogTail                    bool
+	AWSRegions                          []string
+	PolicyLabels                        map[string]string
+	ResourceIdentityFields              map[string][]string
+	CheckTimeout                        time.Duration
+	DebugDumpPayloads                   bool
+	DebugPayloadOutputDir               string
+	PreserveArtifacts                   bool
 }
 
 func (c *PluginConfig) Parse() (*ParsedConfig, error) {
@@ -142,32 +156,41 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 	}
 
 	awsRegions := parseDelimitedList(c.AWSRegions)
+	networkDiagnosticEndpoints := parseDelimitedList(c.CustodianNetworkDiagnosticEndpoints)
 
-	custodianDebug := false
-	if strings.TrimSpace(c.CustodianDebug) != "" {
-		parsedDebug, err := strconv.ParseBool(c.CustodianDebug)
-		if err != nil {
-			return nil, fmt.Errorf("custodian_debug must be a boolean value: %w", err)
-		}
-		custodianDebug = parsedDebug
+	custodianDebug, err := parseOptionalBool("custodian_debug", c.CustodianDebug)
+	if err != nil {
+		return nil, err
 	}
 
-	custodianVerbose := false
-	if strings.TrimSpace(c.CustodianVerbose) != "" {
-		parsedVerbose, err := strconv.ParseBool(c.CustodianVerbose)
-		if err != nil {
-			return nil, fmt.Errorf("custodian_verbose must be a boolean value: %w", err)
-		}
-		custodianVerbose = parsedVerbose
+	custodianVerbose, err := parseOptionalBool("custodian_verbose", c.CustodianVerbose)
+	if err != nil {
+		return nil, err
 	}
 
-	debugDumpPayloads := false
-	if strings.TrimSpace(c.DebugDumpPayloads) != "" {
-		parsedDebug, err := strconv.ParseBool(c.DebugDumpPayloads)
-		if err != nil {
-			return nil, fmt.Errorf("debug_dump_payloads must be a boolean value: %w", err)
-		}
-		debugDumpPayloads = parsedDebug
+	custodianAWSAPITrace, err := parseOptionalBool("custodian_aws_api_trace", c.CustodianAWSAPITrace)
+	if err != nil {
+		return nil, err
+	}
+
+	custodianNetworkDiag, err := parseOptionalBool("custodian_network_diagnostics", c.CustodianNetworkDiag)
+	if err != nil {
+		return nil, err
+	}
+
+	custodianLogTail, err := parseOptionalBool("custodian_log_tail_during_run", c.CustodianLogTail)
+	if err != nil {
+		return nil, err
+	}
+
+	debugDumpPayloads, err := parseOptionalBool("debug_dump_payloads", c.DebugDumpPayloads)
+	if err != nil {
+		return nil, err
+	}
+
+	preserveArtifacts, err := parseOptionalBool("preserve_execution_artifacts", c.PreserveArtifacts)
+	if err != nil {
+		return nil, err
 	}
 
 	debugPayloadOutputDir := strings.TrimSpace(c.DebugPayloadOutputDir)
@@ -179,18 +202,34 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 	}
 
 	return &ParsedConfig{
-		PoliciesYAML:           inlineYAML,
-		PoliciesPath:           policiesPath,
-		CustodianBinary:        resolvedBinary,
-		CustodianDebug:         custodianDebug,
-		CustodianVerbose:       custodianVerbose,
-		AWSRegions:             awsRegions,
-		PolicyLabels:           policyLabels,
-		ResourceIdentityFields: resourceIdentityFields,
-		CheckTimeout:           time.Duration(checkTimeoutSeconds) * time.Second,
-		DebugDumpPayloads:      debugDumpPayloads,
-		DebugPayloadOutputDir:  debugPayloadOutputDir,
+		PoliciesYAML:                        inlineYAML,
+		PoliciesPath:                        policiesPath,
+		CustodianBinary:                     resolvedBinary,
+		CustodianDebug:                      custodianDebug,
+		CustodianVerbose:                    custodianVerbose,
+		CustodianAWSAPITrace:                custodianAWSAPITrace,
+		CustodianNetworkDiag:                custodianNetworkDiag,
+		CustodianNetworkDiagnosticEndpoints: networkDiagnosticEndpoints,
+		CustodianLogTail:                    custodianLogTail,
+		AWSRegions:                          awsRegions,
+		PolicyLabels:                        policyLabels,
+		ResourceIdentityFields:              resourceIdentityFields,
+		CheckTimeout:                        time.Duration(checkTimeoutSeconds) * time.Second,
+		DebugDumpPayloads:                   debugDumpPayloads,
+		DebugPayloadOutputDir:               debugPayloadOutputDir,
+		PreserveArtifacts:                   preserveArtifacts,
 	}, nil
+}
+
+func parseOptionalBool(name, value string) (bool, error) {
+	if strings.TrimSpace(value) == "" {
+		return false, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean value: %w", name, err)
+	}
+	return parsed, nil
 }
 
 func parseDelimitedList(value string) []string {
@@ -212,13 +251,17 @@ type CustodianCheck struct {
 
 // CustodianExecutionRequest contains execution-time settings for one check run.
 type CustodianExecutionRequest struct {
-	BinaryPath string
-	Check      CustodianCheck
-	Timeout    time.Duration
-	OutputDir  string
-	Debug      bool
-	Verbose    bool
-	AWSRegions []string
+	BinaryPath                 string
+	Check                      CustodianCheck
+	Timeout                    time.Duration
+	OutputDir                  string
+	Debug                      bool
+	Verbose                    bool
+	AWSRegions                 []string
+	AWSAPITrace                bool
+	NetworkDiagnostics         bool
+	NetworkDiagnosticEndpoints []string
+	LogTailDuringRun           bool
 }
 
 // CustodianExecutionResult captures runtime output and artifacts from one check run.
@@ -234,6 +277,7 @@ type CustodianExecutionResult struct {
 	Resources     []interface{}
 	ArtifactPath  string
 	ResourcesPath string
+	LogPaths      []string
 }
 
 // CustodianExecutor runs one Cloud Custodian check and captures execution artifacts.
@@ -369,7 +413,29 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 			args = append(args, "--region", region)
 		}
 	}
+	if req.NetworkDiagnostics && strings.EqualFold(req.Check.Provider, "aws") {
+		if diagErr := e.runAWSEndpointDiagnostics(runCtx, req); diagErr != nil {
+			result.Err = fmt.Errorf("aws endpoint network diagnostics failed: %w", diagErr)
+			result.Error = result.Err.Error()
+			result.Errors = []string{result.Error}
+			result.EndedAt = time.Now().UTC()
+			e.Logger.Error("Skipping custodian command because AWS endpoint diagnostics failed", "check_name", req.Check.Name, "error", result.Error)
+			return result
+		}
+	}
 	cmd := exec.CommandContext(runCtx, req.BinaryPath, args...)
+	cmd.Env = os.Environ()
+	if req.AWSAPITrace {
+		traceDir, traceLogPath, traceErr := setupCustodianAWSAPITrace(req.OutputDir)
+		if traceErr != nil {
+			e.Logger.Warn("Failed setting up custodian AWS API trace", "check_name", req.Check.Name, "error", traceErr)
+		} else {
+			cmd.Env = upsertEnv(cmd.Env, "PYTHONPATH", prependPathList(traceDir, os.Getenv("PYTHONPATH")))
+			cmd.Env = upsertEnv(cmd.Env, "CCF_CUSTODIAN_AWS_API_TRACE_LOG", traceLogPath)
+			cmd.Env = upsertEnv(cmd.Env, "PYTHONUNBUFFERED", "1")
+			e.Logger.Info("Custodian AWS API trace enabled", "check_name", req.Check.Name, "trace_log_path", traceLogPath, "pythonpath_dir", traceDir)
+		}
+	}
 	e.Logger.Debug("Executing custodian command",
 		"check_name", req.Check.Name,
 		"command", req.BinaryPath,
@@ -407,6 +473,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		defer ticker.Stop()
 		contextDoneLogged := false
 		runCtxDone := runCtx.Done()
+		lastCustodianLogTail := ""
 		e.Logger.Debug("Starting custodian command monitor loop",
 			"check_name", req.Check.Name,
 			"pid", pid,
@@ -442,6 +509,12 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 					"stdout_len", stdoutBuf.Len(),
 					"stderr_len", stderrBuf.Len(),
 				)
+				if req.NetworkDiagnostics {
+					e.logCustodianProcessSockets(pid, req.Check.Name)
+				}
+				if req.LogTailDuringRun {
+					lastCustodianLogTail = e.logCustodianRunLogTail(req.OutputDir, req.Check.Name, lastCustodianLogTail)
+				}
 			case <-runCtxDone:
 				if !contextDoneLogged {
 					e.Logger.Warn("Custodian command context done while process is still running",
@@ -454,6 +527,12 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 						"stderr_len", stderrBuf.Len(),
 						"stderr_tail", stderrBuf.Tail(custodianOutputTailBytes),
 					)
+					if req.NetworkDiagnostics {
+						e.logCustodianProcessSockets(pid, req.Check.Name)
+					}
+					if req.LogTailDuringRun {
+						lastCustodianLogTail = e.logCustodianRunLogTail(req.OutputDir, req.Check.Name, lastCustodianLogTail)
+					}
 					contextDoneLogged = true
 				}
 				runCtxDone = nil
@@ -486,6 +565,8 @@ commandFinished:
 	if resources != nil {
 		result.Resources = resources
 	}
+	logPaths, logTail, logErr := readCustodianLogArtifacts(req.OutputDir, custodianOutputTailBytes)
+	result.LogPaths = logPaths
 
 	if err != nil {
 		result.Err = fmt.Errorf("custodian execution failed: %w", err)
@@ -506,6 +587,13 @@ commandFinished:
 		result.Err = errors.Join(result.Err, resourcesErr)
 		result.Errors = append(result.Errors, resourcesErr.Error())
 	}
+	if logErr != nil {
+		result.Err = errors.Join(result.Err, logErr)
+		result.Errors = append(result.Errors, logErr.Error())
+	}
+	if result.Err != nil && logTail != "" {
+		result.Errors = append(result.Errors, logTail)
+	}
 
 	if result.Err != nil {
 		result.Error = strings.Join(result.Errors, "; ")
@@ -524,6 +612,483 @@ commandFinished:
 
 	result.EndedAt = time.Now().UTC()
 	return result
+}
+
+func setupCustodianAWSAPITrace(outputDir string) (string, string, error) {
+	traceDir := filepath.Join(outputDir, "ccf-custodian-python-trace")
+	if err := os.MkdirAll(traceDir, 0o700); err != nil {
+		return "", "", err
+	}
+	traceLogPath := filepath.Join(outputDir, "custodian-aws-api-trace.jsonl")
+	siteCustomizePath := filepath.Join(traceDir, "sitecustomize.py")
+	siteCustomize := `import json
+import os
+import sys
+import time
+
+def _ccf_trace_write(record):
+    record["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    line = json.dumps(record, sort_keys=True, default=str)
+    path = os.environ.get("CCF_CUSTODIAN_AWS_API_TRACE_LOG")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception as exc:
+            sys.stderr.write("[CCF_AWS_API_TRACE] trace_write_failed " + type(exc).__name__ + ": " + str(exc) + "\n")
+    sys.stderr.write("[CCF_AWS_API_TRACE] " + line + "\n")
+    sys.stderr.flush()
+
+try:
+    from botocore.client import BaseClient
+    _ccf_original_make_api_call = BaseClient._make_api_call
+
+    def _ccf_make_api_call(self, operation_name, api_params):
+        meta = getattr(self, "meta", None)
+        service = ""
+        endpoint = ""
+        region = ""
+        if meta is not None:
+            service_model = getattr(meta, "service_model", None)
+            service = getattr(service_model, "service_name", "")
+            endpoint = getattr(meta, "endpoint_url", "")
+            region = getattr(meta, "region_name", "")
+        start = time.time()
+        _ccf_trace_write({
+            "event": "aws_api_start",
+            "service": service,
+            "operation": operation_name,
+            "endpoint": endpoint,
+            "region": region,
+        })
+        try:
+            response = _ccf_original_make_api_call(self, operation_name, api_params)
+        except Exception as exc:
+            _ccf_trace_write({
+                "event": "aws_api_error",
+                "service": service,
+                "operation": operation_name,
+                "endpoint": endpoint,
+                "region": region,
+                "elapsed_ms": int((time.time() - start) * 1000),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
+            raise
+        _ccf_trace_write({
+            "event": "aws_api_end",
+            "service": service,
+            "operation": operation_name,
+            "endpoint": endpoint,
+            "region": region,
+            "elapsed_ms": int((time.time() - start) * 1000),
+        })
+        return response
+
+    BaseClient._make_api_call = _ccf_make_api_call
+    _ccf_trace_write({"event": "aws_api_trace_installed"})
+except Exception as exc:
+    sys.stderr.write("[CCF_AWS_API_TRACE] install_failed " + type(exc).__name__ + ": " + str(exc) + "\n")
+    sys.stderr.flush()
+`
+	if err := os.WriteFile(siteCustomizePath, []byte(siteCustomize), 0o600); err != nil {
+		return "", "", err
+	}
+	return traceDir, traceLogPath, nil
+}
+
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for index, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			env[index] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func prependPathList(path, existing string) string {
+	if strings.TrimSpace(existing) == "" {
+		return path
+	}
+	return path + string(os.PathListSeparator) + existing
+}
+
+type networkDiagnosticEndpoint struct {
+	Host       string
+	Port       string
+	ServerName string
+	Source     string
+}
+
+func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context, req CustodianExecutionRequest) error {
+	endpoints, knownResource, endpointErr := awsDiagnosticEndpointsForCheck(req.Check.Resource, req.AWSRegions, req.NetworkDiagnosticEndpoints)
+	if endpointErr != nil {
+		e.Logger.Error("AWS endpoint diagnostics configuration is invalid", "check_name", req.Check.Name, "resource", req.Check.Resource, "error", endpointErr)
+		return endpointErr
+	}
+	if !knownResource {
+		err := fmt.Errorf("resource service is not mapped for AWS endpoint diagnostics: %s", req.Check.Resource)
+		e.Logger.Error("AWS endpoint diagnostics failed before custodian execution", "check_name", req.Check.Name, "resource", req.Check.Resource, "error", err)
+		return err
+	}
+	if len(endpoints) == 0 {
+		err := fmt.Errorf("no concrete AWS endpoint hosts are available for diagnostics; configure aws_regions or custodian_network_diagnostic_endpoints")
+		e.Logger.Error("AWS endpoint diagnostics failed before custodian execution", "check_name", req.Check.Name, "resource", req.Check.Resource, "aws_regions", req.AWSRegions, "error", err)
+		return err
+	}
+
+	var diagnosticsErr error
+	for _, endpoint := range endpoints {
+		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		lookupStarted := time.Now()
+		ips, err := lookupHost(lookupCtx, endpoint.Host)
+		cancel()
+		if err != nil {
+			probeErr := fmt.Errorf("DNS lookup failed for %s endpoint %s: %w", endpoint.Source, endpoint.Host, err)
+			diagnosticsErr = errors.Join(diagnosticsErr, probeErr)
+			e.Logger.Warn("AWS endpoint DNS lookup failed", "check_name", req.Check.Name, "host", endpoint.Host, "source", endpoint.Source, "elapsed", time.Since(lookupStarted).Round(time.Millisecond).String(), "error", err)
+			continue
+		} else {
+			e.Logger.Info("AWS endpoint DNS lookup succeeded", "check_name", req.Check.Name, "host", endpoint.Host, "source", endpoint.Source, "ips", ips, "elapsed", time.Since(lookupStarted).Round(time.Millisecond).String())
+		}
+
+		tlsStarted := time.Now()
+		tlsResult, err := tlsProbeEndpoint(ctx, endpoint)
+		if err != nil {
+			probeErr := fmt.Errorf("TLS handshake failed for %s endpoint %s:%s: %w", endpoint.Source, endpoint.Host, endpoint.Port, err)
+			diagnosticsErr = errors.Join(diagnosticsErr, probeErr)
+			e.Logger.Warn("AWS endpoint TLS probe failed", "check_name", req.Check.Name, "host", endpoint.Host, "port", endpoint.Port, "server_name", endpoint.ServerName, "source", endpoint.Source, "elapsed", time.Since(tlsStarted).Round(time.Millisecond).String(), "error", err)
+			continue
+		}
+		e.Logger.Info("AWS endpoint TLS probe succeeded", "check_name", req.Check.Name, "host", endpoint.Host, "port", endpoint.Port, "server_name", endpoint.ServerName, "source", endpoint.Source, "remote_addr", tlsResult.RemoteAddr, "tls_version", tlsResult.TLSVersion, "elapsed", time.Since(tlsStarted).Round(time.Millisecond).String())
+	}
+	return diagnosticsErr
+}
+
+func awsEndpointHostsForCheck(resource string, regions []string) ([]string, bool) {
+	endpoints, knownResource, err := awsDiagnosticEndpointsForCheck(resource, regions, nil)
+	if err != nil {
+		return nil, knownResource
+	}
+	hosts := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		hosts = append(hosts, endpoint.Host)
+	}
+	return hosts, knownResource
+}
+
+func awsDiagnosticEndpointsForCheck(resource string, regions []string, configuredEndpoints []string) ([]networkDiagnosticEndpoint, bool, error) {
+	services, knownResource := awsServicesForResource(resource)
+	if !knownResource {
+		return nil, false, nil
+	}
+
+	endpoints := make([]networkDiagnosticEndpoint, 0)
+	for _, endpointValue := range configuredEndpoints {
+		endpoint, err := parseNetworkDiagnosticEndpoint(endpointValue)
+		if err != nil {
+			return nil, true, err
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+
+	diagnosticRegions := make([]string, 0, len(regions))
+	for _, region := range regions {
+		region = strings.TrimSpace(region)
+		if region == "" || strings.EqualFold(region, "all") {
+			continue
+		}
+		diagnosticRegions = append(diagnosticRegions, region)
+	}
+	if len(diagnosticRegions) == 0 {
+		return compactUniqueNetworkDiagnosticEndpoints(endpoints), true, nil
+	}
+
+	for _, region := range diagnosticRegions {
+		for _, service := range services {
+			host := fmt.Sprintf("%s.%s.amazonaws.com", service, region)
+			endpoints = append(endpoints, networkDiagnosticEndpoint{
+				Host:       host,
+				Port:       "443",
+				ServerName: host,
+				Source:     "aws-service",
+			})
+		}
+	}
+	return compactUniqueNetworkDiagnosticEndpoints(endpoints), true, nil
+}
+
+func parseNetworkDiagnosticEndpoint(value string) (networkDiagnosticEndpoint, error) {
+	original := strings.TrimSpace(value)
+	if original == "" {
+		return networkDiagnosticEndpoint{}, errors.New("network diagnostic endpoint cannot be empty")
+	}
+	parseValue := original
+	if !strings.Contains(parseValue, "://") {
+		parseValue = "https://" + parseValue
+	}
+	parsed, err := url.Parse(parseValue)
+	if err != nil {
+		return networkDiagnosticEndpoint{}, fmt.Errorf("failed to parse network diagnostic endpoint %q: %w", original, err)
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" {
+		return networkDiagnosticEndpoint{}, fmt.Errorf("network diagnostic endpoint %q does not include a host", original)
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		return networkDiagnosticEndpoint{}, fmt.Errorf("network diagnostic endpoint %q has invalid port %q: %w", original, port, err)
+	}
+	return networkDiagnosticEndpoint{
+		Host:       strings.ToLower(host),
+		Port:       port,
+		ServerName: strings.ToLower(host),
+		Source:     networkDiagnosticEndpointSource(host),
+	}, nil
+}
+
+func networkDiagnosticEndpointSource(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if strings.Contains(host, ".vpce.amazonaws.com") || strings.Contains(host, ".vpce.amazonaws.com.cn") {
+		return "aws-vpc-endpoint"
+	}
+	return "configured"
+}
+
+func compactUniqueNetworkDiagnosticEndpoints(values []networkDiagnosticEndpoint) []networkDiagnosticEndpoint {
+	seen := map[string]bool{}
+	result := make([]networkDiagnosticEndpoint, 0, len(values))
+	for _, value := range values {
+		key := strings.ToLower(net.JoinHostPort(value.Host, value.Port))
+		if value.Host == "" || value.Port == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+type tlsProbeResult struct {
+	RemoteAddr string
+	TLSVersion string
+}
+
+func defaultTLSProbeEndpoint(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < dialer.Timeout {
+			dialer.Timeout = remaining
+		}
+	}
+	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(endpoint.Host, endpoint.Port), &tls.Config{ServerName: endpoint.ServerName, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		return tlsProbeResult{}, err
+	}
+	defer conn.Close()
+
+	state := conn.ConnectionState()
+	return tlsProbeResult{
+		RemoteAddr: conn.RemoteAddr().String(),
+		TLSVersion: tlsVersionString(state.Version),
+	}, nil
+}
+
+func awsServicesForResource(resource string) ([]string, bool) {
+	resource = strings.TrimPrefix(strings.TrimSpace(resource), "aws.")
+	resourceServices := map[string][]string{
+		"app-elb":         {"elasticloadbalancing"},
+		"backup-plan":     {"backup"},
+		"backup-vault":    {"backup"},
+		"cache-cluster":   {"elasticache"},
+		"distribution":    {"cloudfront"},
+		"dynamodb-table":  {"dynamodb"},
+		"ebs":             {"ec2"},
+		"ec2":             {"ec2"},
+		"ecs-service":     {"ecs"},
+		"efs":             {"elasticfilesystem"},
+		"eks":             {"eks"},
+		"firewall":        {"network-firewall"},
+		"hostedzone":      {"route53"},
+		"iam-group":       {"iam"},
+		"iam-policy":      {"iam"},
+		"iam-role":        {"iam"},
+		"iam-user":        {"iam"},
+		"kms-key":         {"kms"},
+		"lambda":          {"lambda"},
+		"log-group":       {"logs"},
+		"rds":             {"rds"},
+		"rds-cluster":     {"rds"},
+		"s3":              {"s3"},
+		"secrets-manager": {"secretsmanager"},
+		"sns":             {"sns"},
+		"sqs":             {"sqs"},
+		"transfer-server": {"transfer"},
+		"wafv2":           {"wafv2"},
+	}
+	services, ok := resourceServices[resource]
+	if !ok {
+		return nil, false
+	}
+	return compactUniqueStrings(append([]string{"sts", "ec2", "tagging"}, services...)), true
+}
+
+func tlsVersionString(version uint16) string {
+	switch version {
+	case tls.VersionTLS10:
+		return "TLS1.0"
+	case tls.VersionTLS11:
+		return "TLS1.1"
+	case tls.VersionTLS12:
+		return "TLS1.2"
+	case tls.VersionTLS13:
+		return "TLS1.3"
+	default:
+		return fmt.Sprintf("0x%x", version)
+	}
+}
+
+func (e *CommandCustodianExecutor) logCustodianProcessSockets(pid int, checkName string) {
+	sockets, err := custodianProcessSockets(pid)
+	if err != nil {
+		e.Logger.Warn("Failed collecting custodian child socket snapshot", "check_name", checkName, "pid", pid, "error", err)
+		return
+	}
+	e.Logger.Info("Custodian child socket snapshot", "check_name", checkName, "pid", pid, "socket_count", len(sockets), "sockets", sockets)
+}
+
+func (e *CommandCustodianExecutor) logCustodianRunLogTail(outputDir, checkName, previous string) string {
+	_, logTail, err := readCustodianLogArtifacts(outputDir, custodianOutputTailBytes)
+	if err != nil {
+		e.Logger.Warn("Failed reading custodian run log tail while process is still running", "check_name", checkName, "error", err)
+		return previous
+	}
+	if strings.TrimSpace(logTail) == "" || logTail == previous {
+		return previous
+	}
+	e.Logger.Info("Custodian run log tail while process is still running", "check_name", checkName, "log_tail", logTail)
+	return logTail
+}
+
+func custodianProcessSockets(pid int) ([]string, error) {
+	inodes, err := processSocketInodes(pid)
+	if err != nil {
+		return nil, err
+	}
+	if len(inodes) == 0 {
+		return []string{}, nil
+	}
+	sockets := make([]string, 0)
+	tcp4, err := readProcNetTCP(filepath.Join("/proc", strconv.Itoa(pid), "net", "tcp"), inodes, false)
+	if err != nil {
+		return nil, err
+	}
+	sockets = append(sockets, tcp4...)
+	tcp6, err := readProcNetTCP(filepath.Join("/proc", strconv.Itoa(pid), "net", "tcp6"), inodes, true)
+	if err != nil {
+		return nil, err
+	}
+	sockets = append(sockets, tcp6...)
+	return sockets, nil
+}
+
+func processSocketInodes(pid int) (map[string]bool, error) {
+	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil, err
+	}
+	inodes := map[string]bool{}
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(target, "socket:[") && strings.HasSuffix(target, "]") {
+			inode := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
+			inodes[inode] = true
+		}
+	}
+	return inodes, nil
+}
+
+func readProcNetTCP(path string, inodes map[string]bool, ipv6 bool) ([]string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	lines := strings.Split(string(content), "\n")
+	sockets := make([]string, 0)
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		inode := fields[9]
+		if !inodes[inode] {
+			continue
+		}
+		local := decodeProcNetAddress(fields[1], ipv6)
+		remote := decodeProcNetAddress(fields[2], ipv6)
+		state := tcpStateName(fields[3])
+		sockets = append(sockets, fmt.Sprintf("local=%s remote=%s state=%s inode=%s", local, remote, state, inode))
+	}
+	return sockets, nil
+}
+
+func decodeProcNetAddress(value string, ipv6 bool) string {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return value
+	}
+	port, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil {
+		return value
+	}
+	if !ipv6 && len(parts[0]) == 8 {
+		ipBytes, err := hex.DecodeString(parts[0])
+		if err == nil && len(ipBytes) == 4 {
+			return fmt.Sprintf("%d.%d.%d.%d:%d", ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0], port)
+		}
+	}
+	return fmt.Sprintf("%s:%d", parts[0], port)
+}
+
+func tcpStateName(state string) string {
+	switch strings.ToUpper(state) {
+	case "01":
+		return "ESTABLISHED"
+	case "02":
+		return "SYN_SENT"
+	case "03":
+		return "SYN_RECV"
+	case "04":
+		return "FIN_WAIT1"
+	case "05":
+		return "FIN_WAIT2"
+	case "06":
+		return "TIME_WAIT"
+	case "07":
+		return "CLOSE"
+	case "08":
+		return "CLOSE_WAIT"
+	case "09":
+		return "LAST_ACK"
+	case "0A":
+		return "LISTEN"
+	case "0B":
+		return "CLOSING"
+	default:
+		return state
+	}
 }
 
 func readResourcesArtifact(outputDir string) (string, []interface{}, error) {
@@ -550,6 +1115,73 @@ func readResourcesArtifact(outputDir string) (string, []interface{}, error) {
 	}
 
 	return resourcesPath, resources, nil
+}
+
+func readCustodianLogArtifacts(outputDir string, maxBytes int) ([]string, string, error) {
+	logPaths, err := findCustodianRunLogs(outputDir)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(logPaths) == 0 {
+		return nil, "", nil
+	}
+
+	sections := make([]string, 0, len(logPaths))
+	for _, logPath := range logPaths {
+		content, err := readFileTail(logPath, maxBytes)
+		if err != nil {
+			return logPaths, "", fmt.Errorf("failed to read custodian log %s: %w", logPath, err)
+		}
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		sections = append(sections, fmt.Sprintf("custodian log tail from %s:\n%s", logPath, content))
+	}
+	return logPaths, strings.Join(sections, "\n"), nil
+}
+
+func findCustodianRunLogs(outputDir string) ([]string, error) {
+	logPaths := make([]string, 0)
+	err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || d.Name() != "custodian-run.log" {
+			return nil
+		}
+		logPaths = append(logPaths, path)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to locate custodian logs: %w", err)
+	}
+	return logPaths, nil
+}
+
+func readFileTail(path string, maxBytes int) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+	offset := int64(0)
+	if maxBytes > 0 && size > int64(maxBytes) {
+		offset = size - int64(maxBytes)
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return "", err
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
 }
 
 func findResourcesJSON(outputDir string) (string, error) {
@@ -1329,6 +1961,11 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 		"policy_labels", parsed.PolicyLabels,
 		"debug_dump_payloads", parsed.DebugDumpPayloads,
 		"debug_payload_output_dir", parsed.DebugPayloadOutputDir,
+		"custodian_aws_api_trace", parsed.CustodianAWSAPITrace,
+		"custodian_network_diagnostics", parsed.CustodianNetworkDiag,
+		"custodian_network_diagnostic_endpoints", parsed.CustodianNetworkDiagnosticEndpoints,
+		"custodian_log_tail_during_run", parsed.CustodianLogTail,
+		"preserve_execution_artifacts", parsed.PreserveArtifacts,
 	)
 
 	resolvedPolicies, err := resolvePoliciesYAML(context.Background(), parsed.PoliciesYAML, parsed.PoliciesPath)
@@ -1485,14 +2122,21 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	if err != nil {
 		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, fmt.Errorf("failed to create execution workspace: %w", err)
 	}
-	defer os.RemoveAll(executionRoot)
-	p.Logger.Debug("Created temporary execution root", "execution_root", executionRoot)
-
 	pendingEvidences := make([]*proto.Evidence, 0, evidenceBatchSize)
 	totalEvidenceCount := 0
 	var accumulatedErrors error
 	successfulPolicyRuns := 0
 	hadCheckExecutionFailures := false
+	defer func() {
+		if p.parsedConfig.PreserveArtifacts && hadCheckExecutionFailures {
+			p.Logger.Warn("Preserving cloud custodian execution artifacts after check execution failure", "execution_root", executionRoot)
+			return
+		}
+		if err := os.RemoveAll(executionRoot); err != nil {
+			p.Logger.Warn("Failed removing temporary execution root", "execution_root", executionRoot, "error", err)
+		}
+	}()
+	p.Logger.Debug("Created temporary execution root", "execution_root", executionRoot)
 
 	baselines := p.collectInventoryBaselines(ctx, executionRoot)
 	for _, check := range p.checks {
@@ -1520,13 +2164,17 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 
 		checkDir := filepath.Join(executionRoot, fmt.Sprintf("%03d-%s", check.Index+1, sanitizeIdentifier(check.Name)))
 		execution := p.executor.Execute(ctx, CustodianExecutionRequest{
-			BinaryPath: p.parsedConfig.CustodianBinary,
-			Check:      check,
-			Timeout:    p.parsedConfig.CheckTimeout,
-			OutputDir:  checkDir,
-			Debug:      p.parsedConfig.CustodianDebug,
-			Verbose:    p.parsedConfig.CustodianVerbose,
-			AWSRegions: p.parsedConfig.AWSRegions,
+			BinaryPath:                 p.parsedConfig.CustodianBinary,
+			Check:                      check,
+			Timeout:                    p.parsedConfig.CheckTimeout,
+			OutputDir:                  checkDir,
+			Debug:                      p.parsedConfig.CustodianDebug,
+			Verbose:                    p.parsedConfig.CustodianVerbose,
+			AWSRegions:                 p.parsedConfig.AWSRegions,
+			AWSAPITrace:                p.parsedConfig.CustodianAWSAPITrace,
+			NetworkDiagnostics:         p.parsedConfig.CustodianNetworkDiag,
+			NetworkDiagnosticEndpoints: p.parsedConfig.CustodianNetworkDiagnosticEndpoints,
+			LogTailDuringRun:           p.parsedConfig.CustodianLogTail,
 		})
 		if execution.Err != nil || execution.Error != "" {
 			err := formatExecutionFailure(check.Name, execution)
@@ -1641,13 +2289,17 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 		check := buildInventoryCheck(resourceType)
 		outputDir := filepath.Join(executionRoot, fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType)))
 		execution := p.executor.Execute(ctx, CustodianExecutionRequest{
-			BinaryPath: p.parsedConfig.CustodianBinary,
-			Check:      check,
-			Timeout:    p.parsedConfig.CheckTimeout,
-			OutputDir:  outputDir,
-			Debug:      p.parsedConfig.CustodianDebug,
-			Verbose:    p.parsedConfig.CustodianVerbose,
-			AWSRegions: p.parsedConfig.AWSRegions,
+			BinaryPath:                 p.parsedConfig.CustodianBinary,
+			Check:                      check,
+			Timeout:                    p.parsedConfig.CheckTimeout,
+			OutputDir:                  outputDir,
+			Debug:                      p.parsedConfig.CustodianDebug,
+			Verbose:                    p.parsedConfig.CustodianVerbose,
+			AWSRegions:                 p.parsedConfig.AWSRegions,
+			AWSAPITrace:                p.parsedConfig.CustodianAWSAPITrace,
+			NetworkDiagnostics:         p.parsedConfig.CustodianNetworkDiag,
+			NetworkDiagnosticEndpoints: p.parsedConfig.CustodianNetworkDiagnosticEndpoints,
+			LogTailDuringRun:           p.parsedConfig.CustodianLogTail,
 		})
 
 		var baselineErr error
@@ -1926,7 +2578,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 			activities,
 			payload,
 		)
-		addResourceExplorerLinkToEvidence(evidences, payload)
+		addResourceExplorerLinkToEvidence(evidences, payload, p.Logger)
 		allEvidences = append(allEvidences, evidences...)
 		if err != nil {
 			p.Logger.Warn("Policy path evaluation failed for resource",
@@ -1957,9 +2609,10 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 	return allEvidences, accumulatedErrors, successfulRuns
 }
 
-func addResourceExplorerLinkToEvidence(evidences []*proto.Evidence, payload *StandardizedResourcePayload) {
-	link := awsResourceExplorerLink(payload)
+func addResourceExplorerLinkToEvidence(evidences []*proto.Evidence, payload *StandardizedResourcePayload, logger hclog.Logger) {
+	link, reason := awsResourceExplorerLink(payload)
 	if link == nil {
+		logResourceExplorerLinkSkipped(logger, payload, reason)
 		return
 	}
 	for _, evidence := range evidences {
@@ -1974,23 +2627,56 @@ func addResourceExplorerLinkToEvidence(evidences []*proto.Evidence, payload *Sta
 	}
 }
 
-func awsResourceExplorerLink(payload *StandardizedResourcePayload) *proto.Link {
-	if href := awsResourceExplorerURL(payload); href != "" {
+func logResourceExplorerLinkSkipped(logger hclog.Logger, payload *StandardizedResourcePayload, reason string) {
+	if logger == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown reason"
+	}
+	var checkName, resourceID, resourceType, provider string
+	if payload != nil {
+		checkName = payload.Check.Name
+		resourceID = payload.Resource.ID
+		resourceType = payload.Resource.Type
+		provider = payload.Resource.Provider
+	}
+	logger.Warn("Skipping AWS Resource Explorer evidence link generation",
+		"reason", reason,
+		"check_name", checkName,
+		"resource_id", resourceID,
+		"resource_type", resourceType,
+		"provider", provider,
+	)
+}
+
+func awsResourceExplorerLink(payload *StandardizedResourcePayload) (*proto.Link, string) {
+	href, reason := awsResourceExplorerURLWithReason(payload)
+	if href != "" {
 		return &proto.Link{
 			Href: href,
 			Rel:  policyManager.Pointer("reference"),
 			Text: policyManager.Pointer("Open in AWS Resource Explorer"),
-		}
+		}, ""
 	}
-	return nil
+	if reason == "" {
+		reason = "unknown reason"
+	}
+	return nil, reason
 }
 
 func awsResourceExplorerURL(payload *StandardizedResourcePayload) string {
-	if payload == nil || !strings.EqualFold(payload.Resource.Provider, "aws") || !strings.HasPrefix(payload.Resource.ID, "arn:") {
-		return ""
+	href, _ := awsResourceExplorerURLWithReason(payload)
+	return href
+}
+
+func awsResourceExplorerURLWithReason(payload *StandardizedResourcePayload) (string, string) {
+	resourceARN, reason := awsResourceExplorerResourceARN(payload)
+	if resourceARN == "" {
+		return "", reason
 	}
 
-	region := awsRegionFromARN(payload.Resource.ID)
+	region := awsRegionFromARN(resourceARN)
 	if region == "" && payload.Resource.Region != "" && payload.Resource.Region != "global" {
 		region = payload.Resource.Region
 	}
@@ -1998,8 +2684,69 @@ func awsResourceExplorerURL(payload *StandardizedResourcePayload) string {
 		region = "us-east-1"
 	}
 
-	query := "id:" + payload.Resource.ID
-	return "https://console.aws.amazon.com/resource-explorer/home?region=" + url.QueryEscape(region) + "#/search?query=" + url.QueryEscape(query)
+	query := "id:" + resourceARN
+	return "https://console.aws.amazon.com/resource-explorer/home?region=" + url.QueryEscape(region) + "#/search?query=" + url.QueryEscape(query), ""
+}
+
+func awsResourceExplorerResourceARN(payload *StandardizedResourcePayload) (string, string) {
+	if payload == nil {
+		return "", "payload is nil"
+	}
+	if !strings.EqualFold(payload.Resource.Provider, "aws") {
+		return "", "provider is not aws"
+	}
+
+	resourceID := strings.TrimSpace(payload.Resource.ID)
+	if resourceID == "" {
+		return "", "resource id is empty"
+	}
+	if strings.HasPrefix(resourceID, "arn:") {
+		return resourceID, ""
+	}
+	if strings.EqualFold(payload.Resource.Type, "aws.s3") {
+		bucketName, ok := normalizeS3BucketName(resourceID)
+		if !ok {
+			return "", "aws.s3 resource id is not a valid S3 bucket name"
+		}
+		return "arn:aws:s3:::" + bucketName, ""
+	}
+	return "", "resource id is not an ARN"
+}
+
+func normalizeS3BucketName(resourceID string) (string, bool) {
+	bucketName := strings.TrimSpace(resourceID)
+	bucketName = strings.TrimPrefix(bucketName, "s3://")
+	if slash := strings.Index(bucketName, "/"); slash >= 0 {
+		bucketName = bucketName[:slash]
+	}
+	if !isValidS3BucketName(bucketName) {
+		return "", false
+	}
+	return bucketName, true
+}
+
+func isValidS3BucketName(bucketName string) bool {
+	if len(bucketName) < 3 || len(bucketName) > 63 {
+		return false
+	}
+	if net.ParseIP(bucketName) != nil {
+		return false
+	}
+	if strings.Contains(bucketName, "..") || strings.Contains(bucketName, ".-") || strings.Contains(bucketName, "-.") {
+		return false
+	}
+	for index, char := range bucketName {
+		valid := char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '.' || char == '-'
+		if !valid {
+			return false
+		}
+		if index == 0 || index == len(bucketName)-1 {
+			if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func awsRegionFromARN(arn string) string {

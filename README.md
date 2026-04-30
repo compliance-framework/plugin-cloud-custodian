@@ -29,6 +29,7 @@ This plugin always enforces read-only Cloud Custodian execution:
 - `--dryrun` is always used.
 - Mutating actions are not applied.
 - For AWS checks, the plugin runs with `--region all` to evaluate across all AWS regions by default unless `aws_regions` is configured.
+- On execution failures or timeouts, the plugin includes the tail of any generated `custodian-run.log` artifacts in the execution error.
 
 ## Configuration
 
@@ -41,12 +42,17 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `custodian_binary` | No | Path/name of Cloud Custodian executable. Default: `custodian`. |
 | `custodian_debug` | No | Boolean (`true`/`false`) toggle to pass `--debug` to Cloud Custodian. This increases Cloud Custodian diagnostic output on stderr. Default: `false`. |
 | `custodian_verbose` | No | Boolean (`true`/`false`) toggle to pass `-v` to Cloud Custodian. This increases Cloud Custodian diagnostic output on stderr. Default: `false`. |
+| `custodian_aws_api_trace` | No | Boolean (`true`/`false`) toggle to inject a temporary Python `sitecustomize.py` into the Custodian child process. Logs botocore API start/end/error events to stderr and `custodian-aws-api-trace.jsonl` in the check output directory. Default: `false`. |
+| `custodian_network_diagnostics` | No | Boolean (`true`/`false`) toggle to run Go DNS/TLS preflight probes for relevant AWS service endpoints before Custodian starts and log child process TCP socket snapshots while Custodian is running. Preflight failures stop the Custodian check before execution. Default: `false`. |
+| `custodian_network_diagnostic_endpoints` | No | Comma or whitespace separated list of additional endpoint hostnames or URLs to DNS/TLS probe when `custodian_network_diagnostics` is enabled. Use this for AWS VPC endpoint DNS names such as `vpce-123.backup.eu-west-1.vpce.amazonaws.com`. Default: unset. |
+| `custodian_log_tail_during_run` | No | Boolean (`true`/`false`) toggle to tail discovered `custodian-run.log` artifacts during the monitor loop, not only after process exit. Default: `false`. |
 | `aws_regions` | No | Comma or whitespace separated AWS regions passed as repeated `--region` flags. Duplicate entries are removed while preserving order. Default: unset, which falls back to `--region all` for AWS checks. |
 | `check_timeout_seconds` | No | Per-check timeout in seconds. Default: `300`. |
 | `policy_labels` | No | JSON map of labels merged into generated evidence labels. |
 | `resource_identity_fields` | No | JSON object mapping Cloud Custodian resource types to ordered identity field paths. Built-in defaults are used after configured fields. Example: `{"aws.ec2":["InstanceId","Arn"]}`. |
 | `debug_dump_payloads` | No | Boolean (`true`/`false`) toggle to write standardized resource payload JSON files for troubleshooting. Default: `false`. |
 | `debug_payload_output_dir` | No | Directory where debug payload JSON files are written. If set, debug dumping is auto-enabled. Default when enabled without explicit path: `debug-standardized-payloads`. |
+| `preserve_execution_artifacts` | No | Boolean (`true`/`false`) toggle to keep the temporary Cloud Custodian execution root after a check execution failure for postmortem review. Default: `false`. |
 
 Validation rules:
 
@@ -149,8 +155,9 @@ Generated evidence labels include `resource_id`, `resource_type`, `provider`,
 and any available `account_id`/`region`. The resource subject includes the
 resource identifier as a link and a `resource_id` property. When the AWS
 resource identifier is an ARN, generated evidence includes an AWS Resource
-Explorer link using an exact `id:<arn>` search. AWS Route53 hosted zone
-identifiers such as `/hostedzone/Z123` are normalized to full ARNs such as
+Explorer link using an exact `id:<arn>` search. AWS S3 bucket names are parsed
+as `arn:aws:s3:::<bucket-name>` for Resource Explorer links. AWS Route53 hosted
+zone identifiers such as `/hostedzone/Z123` are normalized to full ARNs such as
 `arn:aws:route53:::hostedzone/Z123`.
 
 `assessment.inventory_status` is `baseline` for resources found in the unfiltered
