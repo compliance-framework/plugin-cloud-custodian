@@ -1001,6 +1001,10 @@ func (e *CommandCustodianExecutor) logCustodianProcessSockets(pid int, checkName
 		e.Logger.Warn("Failed collecting custodian child socket snapshot", "check_name", checkName, "pid", pid, "error", err)
 		return
 	}
+	if len(sockets) == 0 {
+		e.Logger.Debug("No custodian child sockets found", "check_name", checkName, "pid", pid)
+		return
+	}
 	e.Logger.Info("Custodian child socket snapshot", "check_name", checkName, "pid", pid, "socket_count", len(sockets), "sockets", sockets)
 }
 

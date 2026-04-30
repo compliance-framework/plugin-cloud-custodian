@@ -1146,6 +1146,20 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("does not info log empty socket snapshots", func(t *testing.T) {
+		var logs bytes.Buffer
+		executor := &CommandCustodianExecutor{Logger: hclog.New(&hclog.LoggerOptions{
+			Name:   "test",
+			Level:  hclog.Info,
+			Output: &logs,
+		})}
+
+		executor.logCustodianProcessSockets(-1, "test-policy")
+		if strings.Contains(logs.String(), "Custodian child socket snapshot") {
+			t.Fatalf("expected no info socket snapshot log for empty sockets, got %q", logs.String())
+		}
+	})
+
 	t.Run("reports unknown resource types", func(t *testing.T) {
 		hosts, known := awsEndpointHostsForCheck("aws.not-yet-mapped", []string{"eu-west-1"})
 		if known {
