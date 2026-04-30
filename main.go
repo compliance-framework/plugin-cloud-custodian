@@ -878,6 +878,9 @@ func awsServiceEndpointHost(service string, region string) string {
 	if _, ok := awsGlobalEndpointServices[service]; ok && partition == "aws-cn" {
 		return fmt.Sprintf("%s.%s", service, dnsSuffix)
 	}
+	if _, ok := awsGlobalEndpointServices[service]; ok && partition == "aws-us-gov" {
+		return fmt.Sprintf("%s.us-gov.%s", service, dnsSuffix)
+	}
 	if host, ok := awsGlobalEndpointServices[service]; ok {
 		return host
 	}

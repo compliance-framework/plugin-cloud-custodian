@@ -1099,6 +1099,22 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("uses gov endpoint host for gov global services", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.iam-role", []string{"us-gov-west-1"})
+		if !known {
+			t.Fatalf("expected iam-role to be mapped")
+		}
+		want := []string{
+			"sts.us-gov-west-1.amazonaws.com",
+			"ec2.us-gov-west-1.amazonaws.com",
+			"tagging.us-gov-west-1.amazonaws.com",
+			"iam.us-gov.amazonaws.com",
+		}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") {
+			t.Fatalf("unexpected gov hosts: %#v", hosts)
+		}
+	})
+
 	t.Run("includes configured vpc endpoint hosts", func(t *testing.T) {
 		endpoints, known, err := awsDiagnosticEndpointsForCheck(
 			"aws.backup-vault",
