@@ -1264,17 +1264,17 @@ func readCustodianLogArtifactsForPaths(logPaths []string, maxBytes int) ([]strin
 
 	sections := make([]string, 0, min(len(logPaths), custodianLogTailMaxSections))
 	for i, logPath := range logPaths {
-		if i >= custodianLogTailMaxSections {
-			remaining := len(logPaths) - custodianLogTailMaxSections
-			sections = append(sections, fmt.Sprintf("custodian log tail truncated: %d additional custodian-run.log file(s) omitted", remaining))
-			break
-		}
 		content, err := readFileTail(logPath, maxBytes)
 		if err != nil {
 			return logPaths, "", fmt.Errorf("failed to read custodian log %s: %w", logPath, err)
 		}
 		if strings.TrimSpace(content) == "" {
 			continue
+		}
+		if len(sections) >= custodianLogTailMaxSections {
+			remaining := len(logPaths) - i
+			sections = append(sections, fmt.Sprintf("custodian log tail truncated: %d additional custodian-run.log file(s) omitted", remaining))
+			break
 		}
 		sections = append(sections, fmt.Sprintf("custodian log tail from %s:\n%s", logPath, content))
 	}

@@ -909,6 +909,42 @@ exit 3
 		}
 	})
 
+	t.Run("limits custodian log artifact tails by non empty section count", func(t *testing.T) {
+		root := t.TempDir()
+		logPaths := make([]string, 0, custodianLogTailMaxSections+3)
+		for i := 0; i < custodianLogTailMaxSections+3; i++ {
+			logPath := filepath.Join(root, fmt.Sprintf("log-%02d", i), "custodian-run.log")
+			if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+				t.Fatalf("failed to create log dir: %v", err)
+			}
+			content := []byte(fmt.Sprintf("log detail %02d", i))
+			if i < 2 {
+				content = []byte(" \n\t")
+			}
+			if err := os.WriteFile(logPath, content, 0o600); err != nil {
+				t.Fatalf("failed to write log: %v", err)
+			}
+			logPaths = append(logPaths, logPath)
+		}
+
+		_, logTail, err := readCustodianLogArtifactsForPaths(logPaths, custodianOutputTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected log tail error: %v", err)
+		}
+		if got := strings.Count(logTail, "custodian log tail from"); got != custodianLogTailMaxSections {
+			t.Fatalf("expected %d non-empty log sections, got %d in:\n%s", custodianLogTailMaxSections, got, logTail)
+		}
+		if strings.Contains(logTail, "log detail 00") || strings.Contains(logTail, "log detail 01") {
+			t.Fatalf("expected empty logs not to be included, got:\n%s", logTail)
+		}
+		if !strings.Contains(logTail, "log detail 06") {
+			t.Fatalf("expected empty logs not to consume section budget, got:\n%s", logTail)
+		}
+		if !strings.Contains(logTail, "1 additional custodian-run.log file(s) omitted") {
+			t.Fatalf("expected truncation marker based on remaining paths, got:\n%s", logTail)
+		}
+	})
+
 	t.Run("does not read custodian log artifacts on success by default", func(t *testing.T) {
 		script := `#!/bin/sh
 set -eu
