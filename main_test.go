@@ -1133,6 +1133,16 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects non https configured endpoint schemes", func(t *testing.T) {
+		_, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{"http://vpce-123.backup.eu-west-1.vpce.amazonaws.com:80"})
+		if err == nil {
+			t.Fatalf("expected unsupported endpoint scheme error")
+		}
+		if !strings.Contains(err.Error(), "only https endpoints are supported") {
+			t.Fatalf("expected unsupported scheme detail, got %v", err)
+		}
+	})
+
 	t.Run("tls probe returns immediately when context is canceled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -1750,6 +1760,46 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 				},
 			},
 			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-east-1#/search?query=id%3Aarn%3Aaws%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 bucket in china region uses aws cn partition",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "example-bucket",
+					Type:     "aws.s3",
+					Provider: "aws",
+					Region:   "cn-north-1",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=cn-north-1#/search?query=id%3Aarn%3Aaws-cn%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 bucket in gov region uses aws us gov partition",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "example-bucket",
+					Type:     "aws.s3",
+					Provider: "aws",
+					Region:   "us-gov-west-1",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-gov-west-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 bucket uses account id arn partition hint",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:        "example-bucket",
+					Type:      "aws.s3",
+					Provider:  "aws",
+					AccountID: "arn:aws-us-gov:iam::123456789012:root",
+					Region:    "us-east-1",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-east-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
 			wantLink: true,
 		},
 		{

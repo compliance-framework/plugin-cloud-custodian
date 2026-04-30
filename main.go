@@ -890,6 +890,9 @@ func parseNetworkDiagnosticEndpoint(value string) (networkDiagnosticEndpoint, er
 	if err != nil {
 		return networkDiagnosticEndpoint{}, fmt.Errorf("failed to parse network diagnostic endpoint %q: %w", original, err)
 	}
+	if parsed.Scheme != "" && !strings.EqualFold(parsed.Scheme, "https") {
+		return networkDiagnosticEndpoint{}, fmt.Errorf("network diagnostic endpoint %q has unsupported scheme %q: only https endpoints are supported", original, parsed.Scheme)
+	}
 	host := strings.TrimSpace(parsed.Hostname())
 	if host == "" {
 		return networkDiagnosticEndpoint{}, fmt.Errorf("network diagnostic endpoint %q does not include a host", original)
@@ -2826,9 +2829,36 @@ func awsResourceExplorerResourceARN(payload *StandardizedResourcePayload) (strin
 		if !ok {
 			return "", "aws.s3 resource id is not a valid S3 bucket name"
 		}
-		return "arn:aws:s3:::" + bucketName, ""
+		return "arn:" + awsPartitionForResource(payload.Resource) + ":s3:::" + bucketName, ""
 	}
 	return "", "resource id is not an ARN"
+}
+
+func awsPartitionForResource(resource StandardizedResourceInfo) string {
+	if partition := awsPartitionFromARN(resource.AccountID); partition != "" {
+		return partition
+	}
+	return awsPartitionForRegion(resource.Region)
+}
+
+func awsPartitionFromARN(arnValue string) string {
+	parts := strings.SplitN(strings.TrimSpace(arnValue), ":", 3)
+	if len(parts) >= 2 && parts[0] == "arn" && strings.TrimSpace(parts[1]) != "" {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
+func awsPartitionForRegion(region string) string {
+	region = strings.TrimSpace(strings.ToLower(region))
+	switch {
+	case strings.HasPrefix(region, "cn-"):
+		return "aws-cn"
+	case strings.HasPrefix(region, "us-gov-"):
+		return "aws-us-gov"
+	default:
+		return "aws"
+	}
 }
 
 func normalizeS3BucketName(resourceID string) (string, bool) {
