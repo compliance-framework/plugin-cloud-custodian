@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,22 @@ func stubLookPath(t *testing.T, fn func(string) (string, error)) {
 	lookPath = fn
 	t.Cleanup(func() {
 		lookPath = original
+	})
+}
+
+func stubNetworkDiagnostics(
+	t *testing.T,
+	lookup func(context.Context, string) ([]string, error),
+	tlsProbe func(context.Context, networkDiagnosticEndpoint) (tlsProbeResult, error),
+) {
+	t.Helper()
+	originalLookup := lookupHost
+	originalTLSProbe := tlsProbeEndpoint
+	lookupHost = lookup
+	tlsProbeEndpoint = tlsProbe
+	t.Cleanup(func() {
+		lookupHost = originalLookup
+		tlsProbeEndpoint = originalTLSProbe
 	})
 }
 
@@ -56,12 +73,17 @@ func TestPluginConfigParse(t *testing.T) {
 
 	t.Run("path only", func(t *testing.T) {
 		cfg := &PluginConfig{
-			PoliciesPath:        "/tmp/policies.yaml",
-			CustodianBinary:     "custom-custodian",
-			CustodianDebug:      "true",
-			CustodianVerbose:    "true",
-			CheckTimeoutSeconds: "45",
-			AWSRegions:          "us-east-1, eu-west-1 us-east-1",
+			PoliciesPath:                        "/tmp/policies.yaml",
+			CustodianBinary:                     "custom-custodian",
+			CustodianDebug:                      " true ",
+			CustodianVerbose:                    " true ",
+			CustodianAWSAPITrace:                " true ",
+			CustodianNetworkDiag:                " true ",
+			CustodianNetworkDiagnosticEndpoints: "https://vpce-123.backup.eu-west-1.vpce.amazonaws.com, vpce-456.ec2.eu-west-1.vpce.amazonaws.com",
+			CustodianLogTail:                    " true ",
+			CheckTimeoutSeconds:                 "45",
+			AWSRegions:                          "us-east-1, eu-west-1 us-east-1",
+			PreserveArtifacts:                   " true ",
 		}
 		parsed, err := cfg.Parse()
 		if err != nil {
@@ -82,8 +104,23 @@ func TestPluginConfigParse(t *testing.T) {
 		if !parsed.CustodianVerbose {
 			t.Fatalf("expected custodian verbose to be enabled")
 		}
+		if !parsed.CustodianAWSAPITrace {
+			t.Fatalf("expected custodian AWS API trace to be enabled")
+		}
+		if !parsed.CustodianNetworkDiag {
+			t.Fatalf("expected custodian network diagnostics to be enabled")
+		}
+		if !parsed.CustodianLogTail {
+			t.Fatalf("expected custodian log tailing to be enabled")
+		}
+		if !parsed.PreserveArtifacts {
+			t.Fatalf("expected artifact preservation to be enabled")
+		}
 		if len(parsed.AWSRegions) != 2 || parsed.AWSRegions[0] != "us-east-1" || parsed.AWSRegions[1] != "eu-west-1" {
 			t.Fatalf("unexpected aws regions: %#v", parsed.AWSRegions)
+		}
+		if len(parsed.CustodianNetworkDiagnosticEndpoints) != 2 || parsed.CustodianNetworkDiagnosticEndpoints[0] != "https://vpce-123.backup.eu-west-1.vpce.amazonaws.com" {
+			t.Fatalf("unexpected network diagnostic endpoints: %#v", parsed.CustodianNetworkDiagnosticEndpoints)
 		}
 	})
 
@@ -167,6 +204,21 @@ func TestPluginConfigParse(t *testing.T) {
 		_, err := (&PluginConfig{PoliciesYAML: "x", CustodianVerbose: "not-bool"}).Parse()
 		if err == nil {
 			t.Fatalf("expected error for invalid custodian_verbose")
+		}
+	})
+
+	t.Run("reject invalid diagnostic booleans", func(t *testing.T) {
+		fields := []PluginConfig{
+			{PoliciesYAML: "x", CustodianAWSAPITrace: "not-bool"},
+			{PoliciesYAML: "x", CustodianNetworkDiag: "not-bool"},
+			{PoliciesYAML: "x", CustodianLogTail: "not-bool"},
+			{PoliciesYAML: "x", PreserveArtifacts: "not-bool"},
+		}
+		for _, cfg := range fields {
+			_, err := cfg.Parse()
+			if err == nil {
+				t.Fatalf("expected error for invalid diagnostic boolean in %#v", cfg)
+			}
 		}
 	})
 
@@ -463,6 +515,185 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 	})
 
+	t.Run("network diagnostics failure prevents custodian execution", func(t *testing.T) {
+		executedFile := filepath.Join(t.TempDir(), "executed.txt")
+		t.Setenv("EXECUTED_FILE", executedFile)
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				if endpoint.Source != "aws-vpc-endpoint" {
+					t.Fatalf("expected vpc endpoint source, got %s", endpoint.Source)
+				}
+				if endpoint.Host != "vpce-123.backup.eu-west-1.vpce.amazonaws.com" {
+					t.Fatalf("unexpected endpoint host: %s", endpoint.Host)
+				}
+				return tlsProbeResult{}, errors.New("handshake failed")
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+touch "$EXECUTED_FILE"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:                    5 * time.Second,
+			OutputDir:                  filepath.Join(t.TempDir(), "out"),
+			NetworkDiagnostics:         true,
+			NetworkDiagnosticEndpoints: []string{"https://vpce-123.backup.eu-west-1.vpce.amazonaws.com"},
+		})
+
+		if result.Err == nil {
+			t.Fatalf("expected network diagnostics failure")
+		}
+		if !strings.Contains(result.Error, "aws endpoint network diagnostics failed") || !strings.Contains(result.Error, "handshake failed") {
+			t.Fatalf("expected diagnostic failure detail, got: %s", result.Error)
+		}
+		if _, err := os.Stat(executedFile); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected custodian command not to execute, stat err: %v", err)
+		}
+	})
+
+	t.Run("network diagnostics allow configured endpoints for unmapped resources", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				if endpoint.Host != "vpce-123.example.eu-west-1.vpce.amazonaws.com" {
+					t.Fatalf("unexpected endpoint host: %s", endpoint.Host)
+				}
+				return tlsProbeResult{RemoteAddr: "10.0.0.10:443", TLSVersion: "TLS1.3"}, nil
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.future-resource",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.future-resource"},
+			},
+			Timeout:                    5 * time.Second,
+			OutputDir:                  filepath.Join(t.TempDir(), "out"),
+			NetworkDiagnostics:         true,
+			NetworkDiagnosticEndpoints: []string{"vpce-123.example.eu-west-1.vpce.amazonaws.com"},
+		})
+
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+	})
+
+	t.Run("network diagnostics stop when context is canceled", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				t.Fatalf("did not expect DNS probe after context cancellation, got host %s", host)
+				return nil, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				t.Fatalf("did not expect TLS probe after context cancellation, got endpoint %#v", endpoint)
+				return tlsProbeResult{}, nil
+			},
+		)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := executor.runAWSEndpointDiagnostics(ctx, CustodianExecutionRequest{
+			Check: CustodianCheck{
+				Name:     "test-policy",
+				Resource: "aws.backup-vault",
+				Provider: "aws",
+			},
+			NetworkDiagnosticEndpoints: []string{"vpce-123.backup.eu-west-1.vpce.amazonaws.com"},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled error, got %v", err)
+		}
+	})
+
+	t.Run("network diagnostics skip service probes when regions are not concrete", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				t.Fatalf("did not expect DNS probe for non-concrete regions, got host %s", host)
+				return nil, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				t.Fatalf("did not expect TLS probe for non-concrete regions, got endpoint %#v", endpoint)
+				return tlsProbeResult{}, nil
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:            5 * time.Second,
+			OutputDir:          filepath.Join(t.TempDir(), "out"),
+			AWSRegions:         []string{"all"},
+			NetworkDiagnostics: true,
+		})
+
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+	})
+
 	t.Run("passes debug and verbose args", func(t *testing.T) {
 		argsFile := filepath.Join(t.TempDir(), "args.txt")
 		t.Setenv("ARGS_FILE", argsFile)
@@ -512,6 +743,72 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 	})
 
+	t.Run("injects AWS API trace environment", func(t *testing.T) {
+		envFile := filepath.Join(t.TempDir(), "env.txt")
+		t.Setenv("ENV_FILE", envFile)
+
+		script := `#!/bin/sh
+set -eu
+printf '%s\n%s\n%s\n' "$PYTHONPATH" "$CCF_CUSTODIAN_AWS_API_TRACE_LOG" "$PYTHONUNBUFFERED" > "$ENV_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		outDir := filepath.Join(t.TempDir(), "out")
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:     5 * time.Second,
+			OutputDir:   outDir,
+			AWSAPITrace: true,
+		})
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+
+		content, err := os.ReadFile(envFile)
+		if err != nil {
+			t.Fatalf("failed to read env capture file: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+		if len(lines) != 3 {
+			t.Fatalf("expected three env lines, got %q", string(content))
+		}
+		traceDir := strings.Split(lines[0], string(os.PathListSeparator))[0]
+		if _, err := os.Stat(filepath.Join(traceDir, "sitecustomize.py")); err != nil {
+			t.Fatalf("expected sitecustomize.py in trace dir: %v", err)
+		}
+		if lines[1] != filepath.Join(outDir, "custodian-aws-api-trace.jsonl") {
+			t.Fatalf("unexpected trace log path: %s", lines[1])
+		}
+		traceLogInfo, err := os.Stat(lines[1])
+		if err != nil {
+			t.Fatalf("expected trace log file to be created: %v", err)
+		}
+		if traceLogInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("expected trace log permissions 0600, got %v", traceLogInfo.Mode().Perm())
+		}
+		if lines[2] != "1" {
+			t.Fatalf("expected PYTHONUNBUFFERED=1, got %s", lines[2])
+		}
+	})
+
 	t.Run("timeout cancellation", func(t *testing.T) {
 		script := `#!/bin/sh
 sleep 2
@@ -545,6 +842,213 @@ sleep 2
 		}
 		if deadlineMentions > 1 {
 			t.Fatalf("expected at most one deadline exceeded entry, got: %v", result.Errors)
+		}
+	})
+
+	t.Run("includes custodian log artifacts on failure", func(t *testing.T) {
+		script := `#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy/us-east-1/test-policy"
+printf 'custodian artifact detail\nlast api call before hang\n' > "$out/test-policy/us-east-1/test-policy/custodian-run.log"
+exit 3
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:   5 * time.Second,
+			OutputDir: filepath.Join(t.TempDir(), "out"),
+		})
+
+		if result.Err == nil {
+			t.Fatalf("expected execution failure")
+		}
+		if len(result.LogPaths) != 1 || !strings.HasSuffix(result.LogPaths[0], "custodian-run.log") {
+			t.Fatalf("expected custodian log path to be captured, got %#v", result.LogPaths)
+		}
+		if !strings.Contains(result.Error, "custodian log tail from") {
+			t.Fatalf("expected custodian log tail header in error, got: %s", result.Error)
+		}
+		if !strings.Contains(result.Error, "last api call before hang") {
+			t.Fatalf("expected custodian log content in error, got: %s", result.Error)
+		}
+	})
+
+	t.Run("limits custodian log artifact tails", func(t *testing.T) {
+		root := t.TempDir()
+		logPaths := make([]string, 0, custodianLogTailMaxSections+2)
+		for i := 0; i < custodianLogTailMaxSections+2; i++ {
+			logPath := filepath.Join(root, fmt.Sprintf("log-%02d", i), "custodian-run.log")
+			if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+				t.Fatalf("failed to create log dir: %v", err)
+			}
+			if err := os.WriteFile(logPath, []byte(fmt.Sprintf("log detail %02d", i)), 0o600); err != nil {
+				t.Fatalf("failed to write log: %v", err)
+			}
+			logPaths = append(logPaths, logPath)
+		}
+
+		_, logTail, err := readCustodianLogArtifactsForPaths(logPaths, custodianOutputTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected log tail error: %v", err)
+		}
+		if got := strings.Count(logTail, "custodian log tail from"); got != custodianLogTailMaxSections {
+			t.Fatalf("expected %d log sections, got %d in:\n%s", custodianLogTailMaxSections, got, logTail)
+		}
+		if !strings.Contains(logTail, "2 additional custodian-run.log file(s) omitted") {
+			t.Fatalf("expected truncation marker, got:\n%s", logTail)
+		}
+	})
+
+	t.Run("limits custodian log artifact tails by non empty section count", func(t *testing.T) {
+		root := t.TempDir()
+		logPaths := make([]string, 0, custodianLogTailMaxSections+3)
+		for i := 0; i < custodianLogTailMaxSections+3; i++ {
+			logPath := filepath.Join(root, fmt.Sprintf("log-%02d", i), "custodian-run.log")
+			if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+				t.Fatalf("failed to create log dir: %v", err)
+			}
+			content := []byte(fmt.Sprintf("log detail %02d", i))
+			if i < 2 {
+				content = []byte(" \n\t")
+			}
+			if err := os.WriteFile(logPath, content, 0o600); err != nil {
+				t.Fatalf("failed to write log: %v", err)
+			}
+			logPaths = append(logPaths, logPath)
+		}
+
+		_, logTail, err := readCustodianLogArtifactsForPaths(logPaths, custodianOutputTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected log tail error: %v", err)
+		}
+		if got := strings.Count(logTail, "custodian log tail from"); got != custodianLogTailMaxSections {
+			t.Fatalf("expected %d non-empty log sections, got %d in:\n%s", custodianLogTailMaxSections, got, logTail)
+		}
+		if strings.Contains(logTail, "log detail 00") || strings.Contains(logTail, "log detail 01") {
+			t.Fatalf("expected empty logs not to be included, got:\n%s", logTail)
+		}
+		if !strings.Contains(logTail, "log detail 06") {
+			t.Fatalf("expected empty logs not to consume section budget, got:\n%s", logTail)
+		}
+		if !strings.Contains(logTail, "1 additional custodian-run.log file(s) omitted") {
+			t.Fatalf("expected truncation marker based on remaining paths, got:\n%s", logTail)
+		}
+	})
+
+	t.Run("does not read custodian log artifacts on success by default", func(t *testing.T) {
+		script := `#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy/us-east-1/test-policy"
+printf 'success log detail\n' > "$out/test-policy/us-east-1/test-policy/custodian-run.log"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:   5 * time.Second,
+			OutputDir: filepath.Join(t.TempDir(), "out"),
+		})
+
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+		if len(result.LogPaths) != 0 {
+			t.Fatalf("expected successful execution not to walk log artifacts by default, got %#v", result.LogPaths)
+		}
+	})
+
+	t.Run("finds custodian log artifacts in stable order", func(t *testing.T) {
+		root := t.TempDir()
+		first := filepath.Join(root, "a", "custodian-run.log")
+		second := filepath.Join(root, "z", "custodian-run.log")
+		if err := os.MkdirAll(filepath.Dir(second), 0o755); err != nil {
+			t.Fatalf("failed to create second log dir: %v", err)
+		}
+		if err := os.WriteFile(second, []byte("second"), 0o600); err != nil {
+			t.Fatalf("failed to write second log: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(first), 0o755); err != nil {
+			t.Fatalf("failed to create first log dir: %v", err)
+		}
+		if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
+			t.Fatalf("failed to write first log: %v", err)
+		}
+
+		logPaths, err := findCustodianRunLogs(root)
+		if err != nil {
+			t.Fatalf("unexpected log discovery error: %v", err)
+		}
+		want := []string{first, second}
+		if strings.Join(logPaths, ",") != strings.Join(want, ",") {
+			t.Fatalf("expected sorted log paths %#v, got %#v", want, logPaths)
+		}
+	})
+
+	t.Run("ignores symlinked custodian log artifacts", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "outside.log")
+		if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+			t.Fatalf("failed to write target log: %v", err)
+		}
+		linkDir := filepath.Join(root, "nested")
+		if err := os.MkdirAll(linkDir, 0o755); err != nil {
+			t.Fatalf("failed to create symlink dir: %v", err)
+		}
+		link := filepath.Join(linkDir, "custodian-run.log")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+
+		logPaths, err := findCustodianRunLogs(root)
+		if err != nil {
+			t.Fatalf("unexpected log discovery error: %v", err)
+		}
+		if len(logPaths) != 0 {
+			t.Fatalf("expected symlinked custodian logs to be ignored, got %#v", logPaths)
+		}
+	})
+
+	t.Run("treats missing proc fd directory as empty socket snapshot", func(t *testing.T) {
+		inodes, err := processSocketInodes(-1)
+		if err != nil {
+			t.Fatalf("expected missing process fd directory to be non-fatal, got %v", err)
+		}
+		if len(inodes) != 0 {
+			t.Fatalf("expected no socket inodes for missing process, got %#v", inodes)
 		}
 	})
 
@@ -639,6 +1143,252 @@ func TestCustodianDiagnosticInterval(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDiagnosticHelpers(t *testing.T) {
+	t.Run("maps resource types to expected AWS endpoint hosts", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.backup-vault", []string{"eu-west-1", "all", "eu-west-1"})
+		if !known {
+			t.Fatalf("expected backup-vault to be mapped")
+		}
+		want := []string{
+			"sts.eu-west-1.amazonaws.com",
+			"ec2.eu-west-1.amazonaws.com",
+			"tagging.eu-west-1.amazonaws.com",
+			"backup.eu-west-1.amazonaws.com",
+		}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") {
+			t.Fatalf("unexpected hosts: %#v", hosts)
+		}
+	})
+
+	t.Run("uses global endpoints for global AWS services", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.iam-role", []string{"eu-west-1", "us-east-1"})
+		if !known {
+			t.Fatalf("expected iam-role to be mapped")
+		}
+		want := []string{
+			"sts.eu-west-1.amazonaws.com",
+			"ec2.eu-west-1.amazonaws.com",
+			"tagging.eu-west-1.amazonaws.com",
+			"iam.amazonaws.com",
+			"sts.us-east-1.amazonaws.com",
+			"ec2.us-east-1.amazonaws.com",
+			"tagging.us-east-1.amazonaws.com",
+		}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") {
+			t.Fatalf("unexpected hosts: %#v", hosts)
+		}
+		for _, host := range hosts {
+			if strings.Contains(host, "iam.eu-west-1") || strings.Contains(host, "iam.us-east-1") {
+				t.Fatalf("did not expect regional IAM endpoint host: %#v", hosts)
+			}
+		}
+	})
+
+	t.Run("uses china endpoint suffix for china regions", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.iam-role", []string{"cn-north-1"})
+		if !known {
+			t.Fatalf("expected iam-role to be mapped")
+		}
+		want := []string{
+			"sts.cn-north-1.amazonaws.com.cn",
+			"ec2.cn-north-1.amazonaws.com.cn",
+			"tagging.cn-north-1.amazonaws.com.cn",
+			"iam.amazonaws.com.cn",
+		}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") {
+			t.Fatalf("unexpected china hosts: %#v", hosts)
+		}
+	})
+
+	t.Run("uses gov endpoint host for gov global services", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.iam-role", []string{"us-gov-west-1"})
+		if !known {
+			t.Fatalf("expected iam-role to be mapped")
+		}
+		want := []string{
+			"sts.us-gov-west-1.amazonaws.com",
+			"ec2.us-gov-west-1.amazonaws.com",
+			"tagging.us-gov-west-1.amazonaws.com",
+			"iam.us-gov.amazonaws.com",
+		}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") {
+			t.Fatalf("unexpected gov hosts: %#v", hosts)
+		}
+	})
+
+	t.Run("includes configured vpc endpoint hosts", func(t *testing.T) {
+		endpoints, known, err := awsDiagnosticEndpointsForCheck(
+			"aws.backup-vault",
+			nil,
+			[]string{"https://vpce-123.backup.eu-west-1.vpce.amazonaws.com/path"},
+		)
+		if err != nil {
+			t.Fatalf("unexpected endpoint parse error: %v", err)
+		}
+		if !known {
+			t.Fatalf("expected backup-vault to be mapped")
+		}
+		if len(endpoints) != 1 {
+			t.Fatalf("expected one configured endpoint, got %#v", endpoints)
+		}
+		if endpoints[0].Host != "vpce-123.backup.eu-west-1.vpce.amazonaws.com" {
+			t.Fatalf("unexpected endpoint host: %#v", endpoints[0])
+		}
+		if endpoints[0].Port != "443" {
+			t.Fatalf("unexpected endpoint port: %#v", endpoints[0])
+		}
+		if endpoints[0].Source != "aws-vpc-endpoint" {
+			t.Fatalf("expected vpc endpoint source, got %#v", endpoints[0])
+		}
+	})
+
+	t.Run("uses strict vpc endpoint suffix classification", func(t *testing.T) {
+		if got := networkDiagnosticEndpointSource("evil.vpce.amazonaws.com.attacker.com"); got != "configured" {
+			t.Fatalf("expected attacker suffix not to be classified as vpc endpoint, got %s", got)
+		}
+		if got := networkDiagnosticEndpointSource("vpce-123.backup.eu-west-1.vpce.amazonaws.com"); got != "aws-vpc-endpoint" {
+			t.Fatalf("expected vpc endpoint classification, got %s", got)
+		}
+	})
+
+	t.Run("rejects invalid configured endpoint ports", func(t *testing.T) {
+		_, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{"vpce-123.backup.eu-west-1.vpce.amazonaws.com:not-a-port"})
+		if err == nil {
+			t.Fatalf("expected invalid endpoint port error")
+		}
+		for _, endpoint := range []string{
+			"vpce-123.backup.eu-west-1.vpce.amazonaws.com:0",
+			"vpce-123.backup.eu-west-1.vpce.amazonaws.com:65536",
+		} {
+			if _, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{endpoint}); err == nil {
+				t.Fatalf("expected invalid endpoint port error for %s", endpoint)
+			}
+		}
+	})
+
+	t.Run("rejects non https configured endpoint schemes", func(t *testing.T) {
+		_, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{"http://vpce-123.backup.eu-west-1.vpce.amazonaws.com:80"})
+		if err == nil {
+			t.Fatalf("expected unsupported endpoint scheme error")
+		}
+		if !strings.Contains(err.Error(), "only https endpoints are supported") {
+			t.Fatalf("expected unsupported scheme detail, got %v", err)
+		}
+	})
+
+	t.Run("tls probe returns immediately when context is canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := defaultTLSProbeEndpoint(ctx, networkDiagnosticEndpoint{
+			Host:       "example.invalid",
+			Port:       "443",
+			ServerName: "example.invalid",
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled error, got %v", err)
+		}
+	})
+
+	t.Run("does not info log empty socket snapshots", func(t *testing.T) {
+		var logs bytes.Buffer
+		executor := &CommandCustodianExecutor{Logger: hclog.New(&hclog.LoggerOptions{
+			Name:   "test",
+			Level:  hclog.Info,
+			Output: &logs,
+		})}
+
+		executor.logCustodianProcessSockets(-1, "test-policy")
+		if strings.Contains(logs.String(), "Custodian child socket snapshot") {
+			t.Fatalf("expected no info socket snapshot log for empty sockets, got %q", logs.String())
+		}
+	})
+
+	t.Run("reports unknown resource types", func(t *testing.T) {
+		hosts, known := awsEndpointHostsForCheck("aws.not-yet-mapped", []string{"eu-west-1"})
+		if known {
+			t.Fatalf("expected resource to be unknown")
+		}
+		if len(hosts) != 0 {
+			t.Fatalf("expected no hosts for unknown resource, got %#v", hosts)
+		}
+	})
+
+	t.Run("allows configured endpoints for unknown resource types", func(t *testing.T) {
+		endpoints, known, err := awsDiagnosticEndpointsForCheck("aws.not-yet-mapped", []string{"eu-west-1"}, []string{"vpce-123.example.eu-west-1.vpce.amazonaws.com"})
+		if err != nil {
+			t.Fatalf("unexpected endpoint parse error: %v", err)
+		}
+		if known {
+			t.Fatalf("expected resource to remain unknown")
+		}
+		if len(endpoints) != 1 || endpoints[0].Host != "vpce-123.example.eu-west-1.vpce.amazonaws.com" {
+			t.Fatalf("expected configured endpoint for unknown resource, got %#v", endpoints)
+		}
+	})
+
+	t.Run("maps known policy resource services", func(t *testing.T) {
+		resources := []string{
+			"aws.app-elb",
+			"aws.backup-plan",
+			"aws.backup-vault",
+			"aws.cache-cluster",
+			"aws.distribution",
+			"aws.dynamodb-table",
+			"aws.ebs",
+			"aws.ec2",
+			"aws.ecs-service",
+			"aws.efs",
+			"aws.eks",
+			"aws.firewall",
+			"aws.hostedzone",
+			"aws.iam-group",
+			"aws.iam-policy",
+			"aws.iam-role",
+			"aws.iam-user",
+			"aws.kms-key",
+			"aws.lambda",
+			"aws.log-group",
+			"aws.rds",
+			"aws.rds-cluster",
+			"aws.s3",
+			"aws.secrets-manager",
+			"aws.sns",
+			"aws.sqs",
+			"aws.transfer-server",
+			"aws.wafv2",
+		}
+		for _, resource := range resources {
+			services, known := awsServicesForResource(resource)
+			if !known {
+				t.Fatalf("expected %s to be mapped", resource)
+			}
+			if len(services) == 0 {
+				t.Fatalf("expected %s to have services", resource)
+			}
+		}
+	})
+
+	t.Run("decodes proc net tcp addresses", func(t *testing.T) {
+		got := decodeProcNetAddress("0100007F:01BB", false)
+		if got != "127.0.0.1:443" {
+			t.Fatalf("unexpected decoded address: %s", got)
+		}
+		got = decodeProcNetAddress("00000000000000000000000001000000:01BB", true)
+		if got != "[::1]:443" {
+			t.Fatalf("unexpected decoded IPv6 address: %s", got)
+		}
+	})
+
+	t.Run("upserts environment values", func(t *testing.T) {
+		env := upsertEnv([]string{"A=1", "B=2"}, "A", "3")
+		env = upsertEnv(env, "C", "4")
+		got := strings.Join(env, ",")
+		if got != "A=3,B=2,C=4" {
+			t.Fatalf("unexpected env: %s", got)
+		}
+	})
 }
 
 type fakeExecutor struct {
@@ -1122,10 +1872,88 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 			wantLink: true,
 		},
 		{
-			name: "non arn resource id has no resource explorer link",
+			name: "s3 bucket name uses bucket arn",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "example-bucket",
+					Type:     "aws.s3",
+					Provider: "aws",
+					Region:   "us-west-2",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-west-2#/search?query=id%3Aarn%3Aaws%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 uri uses bucket arn",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "s3://example-bucket/path/to/object",
+					Type:     "aws.s3",
+					Provider: "aws",
+					Region:   "global",
+				},
+			},
+			want:     "https://console.aws.amazon.com/resource-explorer/home?region=us-east-1#/search?query=id%3Aarn%3Aaws%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 bucket in china region uses aws cn partition",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "example-bucket",
+					Type:     "aws.s3",
+					Provider: "aws",
+					Region:   "cn-north-1",
+				},
+			},
+			want:     "https://console.amazonaws.cn/resource-explorer/home?region=cn-north-1#/search?query=id%3Aarn%3Aaws-cn%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 bucket in gov region uses aws us gov partition",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "example-bucket",
+					Type:     "aws.s3",
+					Provider: "aws",
+					Region:   "us-gov-west-1",
+				},
+			},
+			want:     "https://console.amazonaws-us-gov.com/resource-explorer/home?region=us-gov-west-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "s3 bucket uses account id arn partition hint",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:        "example-bucket",
+					Type:      "aws.s3",
+					Provider:  "aws",
+					AccountID: "arn:aws-us-gov:iam::123456789012:root",
+					Region:    "us-east-1",
+				},
+			},
+			want:     "https://console.amazonaws-us-gov.com/resource-explorer/home?region=us-gov-west-1#/search?query=id%3Aarn%3Aaws-us-gov%3As3%3A%3A%3Aexample-bucket",
+			wantLink: true,
+		},
+		{
+			name: "non arn non s3 resource id has no resource explorer link",
 			payload: &StandardizedResourcePayload{
 				Resource: StandardizedResourceInfo{
 					ID:       "bucket-name",
+					Type:     "aws.ec2",
+					Provider: "aws",
+					Region:   "us-east-1",
+				},
+			},
+		},
+		{
+			name: "invalid s3 bucket name has no resource explorer link",
+			payload: &StandardizedResourcePayload{
+				Resource: StandardizedResourceInfo{
+					ID:       "Not A Bucket",
+					Type:     "aws.s3",
 					Provider: "aws",
 					Region:   "us-east-1",
 				},
@@ -1161,7 +1989,7 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 				nil,
 				{UUID: "empty-links"},
 			}
-			addResourceExplorerLinkToEvidence(evidences, tt.payload)
+			addResourceExplorerLinkToEvidence(evidences, tt.payload, hclog.NewNullLogger())
 
 			hasExplorerLink := false
 			for _, link := range evidences[0].Links {
@@ -1192,6 +2020,55 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("logs expected skipped link generation reason at warn", func(t *testing.T) {
+		var logs bytes.Buffer
+		logger := hclog.New(&hclog.LoggerOptions{
+			Name:   "test",
+			Level:  hclog.Warn,
+			Output: &logs,
+		})
+		evidences := []*proto.Evidence{{UUID: "empty-links"}}
+		addResourceExplorerLinkToEvidence(evidences, &StandardizedResourcePayload{
+			Check: StandardizedCheckInfo{Name: "check-a"},
+			Resource: StandardizedResourceInfo{
+				ID:       "Not A Bucket",
+				Type:     "aws.s3",
+				Provider: "aws",
+			},
+		}, logger)
+
+		if len(evidences[0].Links) != 0 {
+			t.Fatalf("expected no links to be added, got %#v", evidences[0].Links)
+		}
+		logOutput := logs.String()
+		if !strings.Contains(logOutput, "Skipping AWS Resource Explorer evidence link generation") {
+			t.Fatalf("expected skipped link warning, got %q", logOutput)
+		}
+		if !strings.Contains(logOutput, "aws.s3 resource id is not a valid S3 bucket name") {
+			t.Fatalf("expected skipped link reason, got %q", logOutput)
+		}
+	})
+
+	t.Run("does not warn for common non arn skipped link generation", func(t *testing.T) {
+		var logs bytes.Buffer
+		logger := hclog.New(&hclog.LoggerOptions{
+			Name:   "test",
+			Level:  hclog.Warn,
+			Output: &logs,
+		})
+		addResourceExplorerLinkToEvidence([]*proto.Evidence{{UUID: "empty-links"}}, &StandardizedResourcePayload{
+			Check: StandardizedCheckInfo{Name: "check-a"},
+			Resource: StandardizedResourceInfo{
+				ID:       "instance-id",
+				Type:     "aws.ec2",
+				Provider: "aws",
+			},
+		}, logger)
+		if logs.String() != "" {
+			t.Fatalf("expected no warn log for common non-ARN skip, got %q", logs.String())
+		}
+	})
 }
 
 func TestBuildResourcePayloadsForCheckDisambiguatesDuplicateResourceIDs(t *testing.T) {
