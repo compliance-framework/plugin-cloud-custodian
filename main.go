@@ -50,6 +50,43 @@ var lookPath = exec.LookPath
 var lookupHost = net.DefaultResolver.LookupHost
 var tlsProbeEndpoint = defaultTLSProbeEndpoint
 
+var awsResourceServices = map[string][]string{
+	"app-elb":         {"elasticloadbalancing"},
+	"backup-plan":     {"backup"},
+	"backup-vault":    {"backup"},
+	"cache-cluster":   {"elasticache"},
+	"distribution":    {"cloudfront"},
+	"dynamodb-table":  {"dynamodb"},
+	"ebs":             {"ec2"},
+	"ec2":             {"ec2"},
+	"ecs-service":     {"ecs"},
+	"efs":             {"elasticfilesystem"},
+	"eks":             {"eks"},
+	"firewall":        {"network-firewall"},
+	"hostedzone":      {"route53"},
+	"iam-group":       {"iam"},
+	"iam-policy":      {"iam"},
+	"iam-role":        {"iam"},
+	"iam-user":        {"iam"},
+	"kms-key":         {"kms"},
+	"lambda":          {"lambda"},
+	"log-group":       {"logs"},
+	"rds":             {"rds"},
+	"rds-cluster":     {"rds"},
+	"s3":              {"s3"},
+	"secrets-manager": {"secretsmanager"},
+	"sns":             {"sns"},
+	"sqs":             {"sqs"},
+	"transfer-server": {"transfer"},
+	"wafv2":           {"wafv2"},
+}
+
+var awsGlobalEndpointServices = map[string]string{
+	"cloudfront": "cloudfront.amazonaws.com",
+	"iam":        "iam.amazonaws.com",
+	"route53":    "route53.amazonaws.com",
+}
+
 // PluginConfig receives string-only config from the agent gRPC interface.
 type PluginConfig struct {
 	PoliciesYAML                        string `mapstructure:"policies_yaml"`
@@ -475,6 +512,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		contextDoneLogged := false
 		runCtxDone := runCtx.Done()
 		lastCustodianLogTail := ""
+		logTailCache := &custodianLogTailCache{}
 		e.Logger.Debug("Starting custodian command monitor loop",
 			"check_name", req.Check.Name,
 			"pid", pid,
@@ -514,7 +552,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 					e.logCustodianProcessSockets(pid, req.Check.Name)
 				}
 				if req.LogTailDuringRun {
-					lastCustodianLogTail = e.logCustodianRunLogTail(req.OutputDir, req.Check.Name, lastCustodianLogTail)
+					lastCustodianLogTail = e.logCustodianRunLogTail(req.OutputDir, req.Check.Name, lastCustodianLogTail, logTailCache)
 				}
 			case <-runCtxDone:
 				if !contextDoneLogged {
@@ -532,7 +570,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 						e.logCustodianProcessSockets(pid, req.Check.Name)
 					}
 					if req.LogTailDuringRun {
-						lastCustodianLogTail = e.logCustodianRunLogTail(req.OutputDir, req.Check.Name, lastCustodianLogTail)
+						lastCustodianLogTail = e.logCustodianRunLogTail(req.OutputDir, req.Check.Name, lastCustodianLogTail, logTailCache)
 					}
 					contextDoneLogged = true
 				}
@@ -741,9 +779,8 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		return err
 	}
 	if len(endpoints) == 0 {
-		err := fmt.Errorf("no concrete AWS endpoint hosts are available for diagnostics; configure aws_regions or custodian_network_diagnostic_endpoints")
-		e.Logger.Error("AWS endpoint diagnostics failed before custodian execution", "check_name", req.Check.Name, "resource", req.Check.Resource, "aws_regions", req.AWSRegions, "error", err)
-		return err
+		e.Logger.Warn("Skipping AWS endpoint diagnostics because no concrete endpoint hosts are available; configure aws_regions or custodian_network_diagnostic_endpoints for preflight probes", "check_name", req.Check.Name, "resource", req.Check.Resource, "aws_regions", req.AWSRegions)
+		return nil
 	}
 	if !knownResource {
 		e.Logger.Warn("AWS endpoint diagnostics will use only configured endpoints because resource service is not mapped", "check_name", req.Check.Name, "resource", req.Check.Resource)
@@ -817,7 +854,7 @@ func awsDiagnosticEndpointsForCheck(resource string, regions []string, configure
 
 	for _, region := range diagnosticRegions {
 		for _, service := range services {
-			host := fmt.Sprintf("%s.%s.amazonaws.com", service, region)
+			host := awsServiceEndpointHost(service, region)
 			endpoints = append(endpoints, networkDiagnosticEndpoint{
 				Host:       host,
 				Port:       "443",
@@ -827,6 +864,14 @@ func awsDiagnosticEndpointsForCheck(resource string, regions []string, configure
 		}
 	}
 	return compactUniqueNetworkDiagnosticEndpoints(endpoints), true, nil
+}
+
+func awsServiceEndpointHost(service string, region string) string {
+	service = strings.TrimSpace(service)
+	if host, ok := awsGlobalEndpointServices[service]; ok {
+		return host
+	}
+	return fmt.Sprintf("%s.%s.amazonaws.com", service, strings.TrimSpace(region))
 }
 
 func parseNetworkDiagnosticEndpoint(value string) (networkDiagnosticEndpoint, error) {
@@ -910,37 +955,7 @@ func defaultTLSProbeEndpoint(ctx context.Context, endpoint networkDiagnosticEndp
 
 func awsServicesForResource(resource string) ([]string, bool) {
 	resource = strings.TrimPrefix(strings.TrimSpace(resource), "aws.")
-	resourceServices := map[string][]string{
-		"app-elb":         {"elasticloadbalancing"},
-		"backup-plan":     {"backup"},
-		"backup-vault":    {"backup"},
-		"cache-cluster":   {"elasticache"},
-		"distribution":    {"cloudfront"},
-		"dynamodb-table":  {"dynamodb"},
-		"ebs":             {"ec2"},
-		"ec2":             {"ec2"},
-		"ecs-service":     {"ecs"},
-		"efs":             {"elasticfilesystem"},
-		"eks":             {"eks"},
-		"firewall":        {"network-firewall"},
-		"hostedzone":      {"route53"},
-		"iam-group":       {"iam"},
-		"iam-policy":      {"iam"},
-		"iam-role":        {"iam"},
-		"iam-user":        {"iam"},
-		"kms-key":         {"kms"},
-		"lambda":          {"lambda"},
-		"log-group":       {"logs"},
-		"rds":             {"rds"},
-		"rds-cluster":     {"rds"},
-		"s3":              {"s3"},
-		"secrets-manager": {"secretsmanager"},
-		"sns":             {"sns"},
-		"sqs":             {"sqs"},
-		"transfer-server": {"transfer"},
-		"wafv2":           {"wafv2"},
-	}
-	services, ok := resourceServices[resource]
+	services, ok := awsResourceServices[resource]
 	if !ok {
 		return nil, false
 	}
@@ -971,8 +986,21 @@ func (e *CommandCustodianExecutor) logCustodianProcessSockets(pid int, checkName
 	e.Logger.Info("Custodian child socket snapshot", "check_name", checkName, "pid", pid, "socket_count", len(sockets), "sockets", sockets)
 }
 
-func (e *CommandCustodianExecutor) logCustodianRunLogTail(outputDir, checkName, previous string) string {
-	_, logTail, err := readCustodianLogArtifacts(outputDir, custodianOutputTailBytes)
+type custodianLogTailCache struct {
+	paths         []string
+	nextDiscovery time.Time
+}
+
+func (e *CommandCustodianExecutor) logCustodianRunLogTail(outputDir, checkName, previous string, cache *custodianLogTailCache) string {
+	logPaths, err := cachedCustodianRunLogPaths(outputDir, cache)
+	if err != nil {
+		e.Logger.Warn("Failed locating custodian run logs while process is still running", "check_name", checkName, "error", err)
+		return previous
+	}
+	if len(logPaths) == 0 {
+		return previous
+	}
+	_, logTail, err := readCustodianLogArtifactsForPaths(logPaths, custodianOutputTailBytes)
 	if err != nil {
 		e.Logger.Warn("Failed reading custodian run log tail while process is still running", "check_name", checkName, "error", err)
 		return previous
@@ -982,6 +1010,26 @@ func (e *CommandCustodianExecutor) logCustodianRunLogTail(outputDir, checkName, 
 	}
 	e.Logger.Info("Custodian run log tail while process is still running", "check_name", checkName, "log_tail", logTail)
 	return logTail
+}
+
+func cachedCustodianRunLogPaths(outputDir string, cache *custodianLogTailCache) ([]string, error) {
+	if cache == nil {
+		return findCustodianRunLogs(outputDir)
+	}
+	now := time.Now()
+	if now.Before(cache.nextDiscovery) {
+		return cache.paths, nil
+	}
+	logPaths, err := findCustodianRunLogs(outputDir)
+	if err != nil {
+		return nil, err
+	}
+	cache.paths = logPaths
+	cache.nextDiscovery = now.Add(2 * time.Minute)
+	if len(cache.paths) == 0 {
+		cache.nextDiscovery = now.Add(30 * time.Second)
+	}
+	return cache.paths, nil
 }
 
 func custodianProcessSockets(pid int) ([]string, error) {
@@ -1150,6 +1198,10 @@ func readCustodianLogArtifacts(outputDir string, maxBytes int) ([]string, string
 	if err != nil {
 		return nil, "", err
 	}
+	return readCustodianLogArtifactsForPaths(logPaths, maxBytes)
+}
+
+func readCustodianLogArtifactsForPaths(logPaths []string, maxBytes int) ([]string, string, error) {
 	if len(logPaths) == 0 {
 		return nil, "", nil
 	}
@@ -1183,6 +1235,7 @@ func findCustodianRunLogs(outputDir string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to locate custodian logs: %w", err)
 	}
+	slices.Sort(logPaths)
 	return logPaths, nil
 }
 
@@ -2669,13 +2722,28 @@ func logResourceExplorerLinkSkipped(logger hclog.Logger, payload *StandardizedRe
 		resourceType = payload.Resource.Type
 		provider = payload.Resource.Provider
 	}
-	logger.Warn("Skipping AWS Resource Explorer evidence link generation",
+	message := "Skipping AWS Resource Explorer evidence link generation"
+	args := []interface{}{
 		"reason", reason,
 		"check_name", checkName,
 		"resource_id", resourceID,
 		"resource_type", resourceType,
 		"provider", provider,
-	)
+	}
+	if shouldWarnResourceExplorerLinkSkipped(reason) {
+		logger.Warn(message, args...)
+		return
+	}
+	logger.Debug(message, args...)
+}
+
+func shouldWarnResourceExplorerLinkSkipped(reason string) bool {
+	switch reason {
+	case "resource id is not an ARN", "provider is not aws":
+		return false
+	default:
+		return true
+	}
 }
 
 func awsResourceExplorerLink(payload *StandardizedResourcePayload) (*proto.Link, string) {
