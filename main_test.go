@@ -616,6 +616,35 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 	})
 
+	t.Run("network diagnostics stop when context is canceled", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				t.Fatalf("did not expect DNS probe after context cancellation, got host %s", host)
+				return nil, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				t.Fatalf("did not expect TLS probe after context cancellation, got endpoint %#v", endpoint)
+				return tlsProbeResult{}, nil
+			},
+		)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := executor.runAWSEndpointDiagnostics(ctx, CustodianExecutionRequest{
+			Check: CustodianCheck{
+				Name:     "test-policy",
+				Resource: "aws.backup-vault",
+				Provider: "aws",
+			},
+			NetworkDiagnosticEndpoints: []string{"vpce-123.backup.eu-west-1.vpce.amazonaws.com"},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled error, got %v", err)
+		}
+	})
+
 	t.Run("network diagnostics skip service probes when regions are not concrete", func(t *testing.T) {
 		stubNetworkDiagnostics(
 			t,
@@ -1093,6 +1122,27 @@ func TestDiagnosticHelpers(t *testing.T) {
 		_, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{"vpce-123.backup.eu-west-1.vpce.amazonaws.com:not-a-port"})
 		if err == nil {
 			t.Fatalf("expected invalid endpoint port error")
+		}
+		for _, endpoint := range []string{
+			"vpce-123.backup.eu-west-1.vpce.amazonaws.com:0",
+			"vpce-123.backup.eu-west-1.vpce.amazonaws.com:65536",
+		} {
+			if _, _, err := awsDiagnosticEndpointsForCheck("aws.backup-vault", nil, []string{endpoint}); err == nil {
+				t.Fatalf("expected invalid endpoint port error for %s", endpoint)
+			}
+		}
+	})
+
+	t.Run("tls probe returns immediately when context is canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := defaultTLSProbeEndpoint(ctx, networkDiagnosticEndpoint{
+			Host:       "example.invalid",
+			Port:       "443",
+			ServerName: "example.invalid",
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled error, got %v", err)
 		}
 	})
 
@@ -1801,7 +1851,7 @@ func TestAWSResourceExplorerURL(t *testing.T) {
 		}
 	})
 
-	t.Run("logs common non arn skipped link generation at debug", func(t *testing.T) {
+	t.Run("does not warn for common non arn skipped link generation", func(t *testing.T) {
 		var logs bytes.Buffer
 		logger := hclog.New(&hclog.LoggerOptions{
 			Name:   "test",

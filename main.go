@@ -788,6 +788,9 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 
 	var diagnosticsErr error
 	for _, endpoint := range endpoints {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(diagnosticsErr, err)
+		}
 		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		lookupStarted := time.Now()
 		ips, err := lookupHost(lookupCtx, endpoint.Host)
@@ -895,8 +898,12 @@ func parseNetworkDiagnosticEndpoint(value string) (networkDiagnosticEndpoint, er
 	if port == "" {
 		port = "443"
 	}
-	if _, err := strconv.Atoi(port); err != nil {
+	portNumber, err := strconv.Atoi(port)
+	if err != nil {
 		return networkDiagnosticEndpoint{}, fmt.Errorf("network diagnostic endpoint %q has invalid port %q: %w", original, port, err)
+	}
+	if portNumber < 1 || portNumber > 65535 {
+		return networkDiagnosticEndpoint{}, fmt.Errorf("network diagnostic endpoint %q has invalid port %q: must be between 1 and 65535", original, port)
 	}
 	return networkDiagnosticEndpoint{
 		Host:       strings.ToLower(host),
@@ -934,19 +941,30 @@ type tlsProbeResult struct {
 }
 
 func defaultTLSProbeEndpoint(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	if err := ctx.Err(); err != nil {
+		return tlsProbeResult{}, err
+	}
+	netDialer := &net.Dialer{Timeout: 5 * time.Second}
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining > 0 && remaining < dialer.Timeout {
-			dialer.Timeout = remaining
+		if remaining := time.Until(deadline); remaining > 0 && remaining < netDialer.Timeout {
+			netDialer.Timeout = remaining
 		}
 	}
-	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(endpoint.Host, endpoint.Port), &tls.Config{ServerName: endpoint.ServerName, MinVersion: tls.VersionTLS12})
+	tlsDialer := &tls.Dialer{
+		NetDialer: netDialer,
+		Config:    &tls.Config{ServerName: endpoint.ServerName, MinVersion: tls.VersionTLS12},
+	}
+	conn, err := tlsDialer.DialContext(ctx, "tcp", net.JoinHostPort(endpoint.Host, endpoint.Port))
 	if err != nil {
 		return tlsProbeResult{}, err
 	}
 	defer conn.Close()
 
-	state := conn.ConnectionState()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return tlsProbeResult{}, errors.New("TLS dial returned non-TLS connection")
+	}
+	state := tlsConn.ConnectionState()
 	return tlsProbeResult{
 		RemoteAddr: conn.RemoteAddr().String(),
 		TLSVersion: tlsVersionString(state.Version),
