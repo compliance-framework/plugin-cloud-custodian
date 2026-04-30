@@ -949,6 +949,30 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 	})
 
+	t.Run("ignores symlinked custodian log artifacts", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "outside.log")
+		if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+			t.Fatalf("failed to write target log: %v", err)
+		}
+		linkDir := filepath.Join(root, "nested")
+		if err := os.MkdirAll(linkDir, 0o755); err != nil {
+			t.Fatalf("failed to create symlink dir: %v", err)
+		}
+		link := filepath.Join(linkDir, "custodian-run.log")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+
+		logPaths, err := findCustodianRunLogs(root)
+		if err != nil {
+			t.Fatalf("unexpected log discovery error: %v", err)
+		}
+		if len(logPaths) != 0 {
+			t.Fatalf("expected symlinked custodian logs to be ignored, got %#v", logPaths)
+		}
+	})
+
 	t.Run("strips plugin-only policy fields before custodian execution", func(t *testing.T) {
 		script := `#!/bin/sh
 set -eu

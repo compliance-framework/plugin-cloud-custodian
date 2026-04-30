@@ -634,8 +634,15 @@ commandFinished:
 		result.Errors = append(result.Errors, resourcesErr.Error())
 	}
 	if logErr != nil {
-		result.Err = errors.Join(result.Err, logErr)
-		result.Errors = append(result.Errors, logErr.Error())
+		if result.Err != nil {
+			result.Err = errors.Join(result.Err, logErr)
+			result.Errors = append(result.Errors, logErr.Error())
+		} else {
+			e.Logger.Warn("Failed collecting custodian log artifacts after successful execution",
+				"check_name", req.Check.Name,
+				"error", logErr,
+			)
+		}
 	}
 	if result.Err != nil && logTail != "" {
 		result.Errors = append(result.Errors, logTail)
@@ -1269,6 +1276,9 @@ func findCustodianRunLogs(outputDir string) ([]string, error) {
 			return walkErr
 		}
 		if d.IsDir() || d.Name() != "custodian-run.log" {
+			return nil
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
 		logPaths = append(logPaths, path)
