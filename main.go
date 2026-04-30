@@ -1278,7 +1278,11 @@ func findCustodianRunLogs(outputDir string) ([]string, error) {
 		if d.IsDir() || d.Name() != "custodian-run.log" {
 			return nil
 		}
-		if d.Type()&fs.ModeSymlink != 0 {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
 			return nil
 		}
 		logPaths = append(logPaths, path)
