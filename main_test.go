@@ -1719,14 +1719,14 @@ func TestEvalLoopBehavior(t *testing.T) {
 				EndedAt:          now.Add(5 * time.Millisecond),
 				ExitCode:         0,
 				Resources:        []interface{}{map[string]interface{}{"id": "bucket-1"}},
-				DiagnosticErrors: []string{"cloud custodian policy inventory-aws-s3 could not be checked for unavailable AWS service endpoint s3.eu-west-1"},
+				DiagnosticErrors: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy inventory-aws-s3; evaluation may be partial"},
 			},
 			"check-a": {
 				StartedAt:        now,
 				EndedAt:          now.Add(20 * time.Millisecond),
 				ExitCode:         0,
 				Resources:        []interface{}{},
-				DiagnosticErrors: []string{"cloud custodian policy check-a could not be checked for unavailable AWS service endpoint s3.eu-west-1"},
+				DiagnosticErrors: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy check-a; evaluation may be partial"},
 			},
 		}}
 

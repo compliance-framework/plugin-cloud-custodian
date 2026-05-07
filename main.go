@@ -885,7 +885,7 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		if err != nil {
 			result.recordFailure(endpoint, "DNS lookup", err)
 			e.Logger.Warn("AWS endpoint DNS lookup failed", "check_name", req.Check.Name, "host", endpoint.Host, "source", endpoint.Source, "elapsed", time.Since(lookupStarted).Round(time.Millisecond).String(), "error", err)
-			e.Logger.Warn("Cloud Custodian policy could not be checked for unavailable AWS service endpoint",
+			e.Logger.Warn("Cloud Custodian detected an unreachable AWS service endpoint; evaluation may be partial",
 				"check_name", req.Check.Name,
 				"resource", req.Check.Resource,
 				"service", endpoint.Service,
@@ -904,7 +904,7 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		if err != nil {
 			result.recordFailure(endpoint, "TLS handshake", err)
 			e.Logger.Warn("AWS endpoint TLS probe failed", "check_name", req.Check.Name, "host", endpoint.Host, "port", endpoint.Port, "server_name", endpoint.ServerName, "source", endpoint.Source, "elapsed", time.Since(tlsStarted).Round(time.Millisecond).String(), "error", err)
-			e.Logger.Warn("Cloud Custodian policy could not be checked for unavailable AWS service endpoint",
+			e.Logger.Warn("Cloud Custodian detected an unreachable AWS service endpoint; evaluation may be partial",
 				"check_name", req.Check.Name,
 				"resource", req.Check.Resource,
 				"service", endpoint.Service,
@@ -956,12 +956,12 @@ func (r awsEndpointDiagnosticResult) executionErrors(check CustodianCheck) []str
 			region = "global"
 		}
 		messages = append(messages, fmt.Sprintf(
-			"cloud custodian policy %s could not be checked for unavailable AWS service endpoint %s.%s (%s:%s): %s failed: %v",
-			check.Name,
+			"unreachable AWS service endpoint %s.%s (%s:%s) detected while evaluating cloud custodian policy %s; evaluation may be partial: %s failed: %v",
 			service,
 			region,
 			endpoint.Host,
 			endpoint.Port,
+			check.Name,
 			failure.Stage,
 			failure.Err,
 		))
@@ -2459,7 +2459,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 		if baseline == nil || baseline.Err != nil || len(baseline.Execution.DiagnosticErrors) == 0 {
 			continue
 		}
-		err := formatExecutionDiagnosticErrors(fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType)), baseline.Execution.DiagnosticErrors)
+		err := formatExecutionDiagnosticErrors(baseline.Execution.DiagnosticErrors)
 		p.Logger.Warn("Inventory baseline completed with unavailable AWS service endpoints", "resource", resourceType, "error", err)
 		accumulatedErrors = errors.Join(accumulatedErrors, err)
 		hadCheckExecutionFailures = true
@@ -2560,7 +2560,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			}
 		}
 		if len(execution.DiagnosticErrors) > 0 {
-			err := formatExecutionDiagnosticErrors(check.Name, execution.DiagnosticErrors)
+			err := formatExecutionDiagnosticErrors(execution.DiagnosticErrors)
 			p.Logger.Warn("Check completed with unavailable AWS service endpoints", "check_name", check.Name, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
 			hadCheckExecutionFailures = true
@@ -3187,7 +3187,7 @@ func formatExecutionFailure(checkName string, execution CustodianExecutionResult
 	}
 }
 
-func formatExecutionDiagnosticErrors(_ string, messages []string) error {
+func formatExecutionDiagnosticErrors(messages []string) error {
 	var err error
 	for _, message := range messages {
 		message = strings.TrimSpace(message)
