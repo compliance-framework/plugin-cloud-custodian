@@ -515,7 +515,7 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 	})
 
-	t.Run("network diagnostics failure prevents custodian execution", func(t *testing.T) {
+	t.Run("network diagnostics failure warns and still executes custodian", func(t *testing.T) {
 		executedFile := filepath.Join(t.TempDir(), "executed.txt")
 		t.Setenv("EXECUTED_FILE", executedFile)
 		stubNetworkDiagnostics(
@@ -537,6 +537,17 @@ printf '[]' > "$out/test-policy/resources.json"
 		script := `#!/bin/sh
 set -eu
 touch "$EXECUTED_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
 `
 		binary := writeExecutableScript(t, script)
 		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
@@ -555,11 +566,192 @@ touch "$EXECUTED_FILE"
 			NetworkDiagnosticEndpoints: []string{"https://vpce-123.backup.eu-west-1.vpce.amazonaws.com"},
 		})
 
-		if result.Err == nil {
-			t.Fatalf("expected network diagnostics failure")
+		if result.Err != nil {
+			t.Fatalf("expected diagnostic failure to be non-fatal, got: %v", result.Err)
 		}
-		if !strings.Contains(result.Error, "aws endpoint network diagnostics failed") || !strings.Contains(result.Error, "handshake failed") {
-			t.Fatalf("expected diagnostic failure detail, got: %s", result.Error)
+		if _, err := os.Stat(executedFile); err != nil {
+			t.Fatalf("expected custodian command to execute, stat err: %v", err)
+		}
+		if len(result.DiagnosticWarnings) != 1 || !strings.Contains(result.DiagnosticWarnings[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning to be captured, got %#v", result.DiagnosticWarnings)
+		}
+		if len(result.Errors) != 0 {
+			t.Fatalf("did not expect successful execution warnings to be surfaced as errors, got %#v", result.Errors)
+		}
+		if result.Error != "" {
+			t.Fatalf("did not expect successful execution to set Error, got %q", result.Error)
+		}
+		executionInfo := buildExecutionInfo(result)
+		if executionInfo.Status != "success" {
+			t.Fatalf("expected successful execution status, got %q", executionInfo.Status)
+		}
+		if len(executionInfo.Warnings) != 1 || !strings.Contains(executionInfo.Warnings[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning in execution warnings, got %#v", executionInfo.Warnings)
+		}
+		if len(executionInfo.Errors) != 0 {
+			t.Fatalf("did not expect diagnostic warning in execution errors, got %#v", executionInfo.Errors)
+		}
+	})
+
+	t.Run("network diagnostics warnings are included when custodian execution fails", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				return tlsProbeResult{}, errors.New("handshake failed")
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+exit 7
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:                    5 * time.Second,
+			OutputDir:                  filepath.Join(t.TempDir(), "out"),
+			NetworkDiagnostics:         true,
+			NetworkDiagnosticEndpoints: []string{"https://vpce-123.backup.eu-west-1.vpce.amazonaws.com"},
+		})
+		if result.Err == nil {
+			t.Fatalf("expected custodian execution failure")
+		}
+		if !strings.Contains(result.Error, "custodian execution failed") {
+			t.Fatalf("expected custodian execution error, got %q", result.Error)
+		}
+		if !strings.Contains(result.Error, "handshake failed") {
+			t.Fatalf("expected diagnostic warning to be included in execution error, got %q", result.Error)
+		}
+		for _, executionError := range result.Errors {
+			if strings.Contains(executionError, "handshake failed") {
+				t.Fatalf("did not expect diagnostic warning to be classified as execution error, got %#v", result.Errors)
+			}
+		}
+		executionInfo := buildExecutionInfo(result)
+		if len(executionInfo.Warnings) != 1 || !strings.Contains(executionInfo.Warnings[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning in execution warnings, got %#v", executionInfo.Warnings)
+		}
+	})
+
+	t.Run("network diagnostics filters unavailable concrete aws regions", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		t.Setenv("ARGS_FILE", argsFile)
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				if endpoint.Host == "s3.eu-west-2.amazonaws.com" {
+					return tlsProbeResult{}, errors.New("handshake failed")
+				}
+				return tlsProbeResult{RemoteAddr: "10.0.0.10:443", TLSVersion: "TLS1.3"}, nil
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+echo "$@" > "$ARGS_FILE"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-s" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out/test-policy"
+printf '[]' > "$out/test-policy/resources.json"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.s3",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.s3"},
+			},
+			Timeout:            5 * time.Second,
+			OutputDir:          filepath.Join(t.TempDir(), "out"),
+			AWSRegions:         []string{"eu-west-1", "eu-west-2"},
+			NetworkDiagnostics: true,
+		})
+		if result.Err != nil {
+			t.Fatalf("expected successful execution, got error: %v", result.Err)
+		}
+		if len(result.DiagnosticWarnings) != 1 || !strings.Contains(result.DiagnosticWarnings[0], "s3.eu-west-2.amazonaws.com") {
+			t.Fatalf("expected unavailable region diagnostic warning, got %#v", result.DiagnosticWarnings)
+		}
+
+		argsContent, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("failed to read args capture file: %v", err)
+		}
+		argsStr := string(argsContent)
+		if !strings.Contains(argsStr, "--region eu-west-1") {
+			t.Fatalf("expected available region to be passed, got: %s", argsStr)
+		}
+		if strings.Contains(argsStr, "--region eu-west-2") {
+			t.Fatalf("did not expect unavailable region to be passed, got: %s", argsStr)
+		}
+	})
+
+	t.Run("network diagnostics skips custodian when all concrete aws regions are unavailable", func(t *testing.T) {
+		executedFile := filepath.Join(t.TempDir(), "executed.txt")
+		t.Setenv("EXECUTED_FILE", executedFile)
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				return tlsProbeResult{}, fmt.Errorf("%s unavailable", endpoint.Host)
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+touch "$EXECUTED_FILE"
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:            5 * time.Second,
+			OutputDir:          filepath.Join(t.TempDir(), "out"),
+			AWSRegions:         []string{"eu-west-1", "eu-west-2"},
+			NetworkDiagnostics: true,
+		})
+		if result.Err == nil {
+			t.Fatalf("expected all-unavailable diagnostics to skip with execution error")
+		}
+		if !strings.Contains(result.Error, "no AWS service endpoints were reachable") {
+			t.Fatalf("expected all-unavailable error detail, got %q", result.Error)
+		}
+		if len(result.DiagnosticWarnings) != 2 {
+			t.Fatalf("expected both unavailable endpoint diagnostics, got %#v", result.DiagnosticWarnings)
 		}
 		if _, err := os.Stat(executedFile); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected custodian command not to execute, stat err: %v", err)
@@ -632,7 +824,7 @@ printf '[]' > "$out/test-policy/resources.json"
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		err := executor.runAWSEndpointDiagnostics(ctx, CustodianExecutionRequest{
+		_, err := executor.runAWSEndpointDiagnostics(ctx, CustodianExecutionRequest{
 			Check: CustodianCheck{
 				Name:     "test-policy",
 				Resource: "aws.backup-vault",
@@ -1152,9 +1344,6 @@ func TestDiagnosticHelpers(t *testing.T) {
 			t.Fatalf("expected backup-vault to be mapped")
 		}
 		want := []string{
-			"sts.eu-west-1.amazonaws.com",
-			"ec2.eu-west-1.amazonaws.com",
-			"tagging.eu-west-1.amazonaws.com",
 			"backup.eu-west-1.amazonaws.com",
 		}
 		if strings.Join(hosts, ",") != strings.Join(want, ",") {
@@ -1168,13 +1357,7 @@ func TestDiagnosticHelpers(t *testing.T) {
 			t.Fatalf("expected iam-role to be mapped")
 		}
 		want := []string{
-			"sts.eu-west-1.amazonaws.com",
-			"ec2.eu-west-1.amazonaws.com",
-			"tagging.eu-west-1.amazonaws.com",
 			"iam.amazonaws.com",
-			"sts.us-east-1.amazonaws.com",
-			"ec2.us-east-1.amazonaws.com",
-			"tagging.us-east-1.amazonaws.com",
 		}
 		if strings.Join(hosts, ",") != strings.Join(want, ",") {
 			t.Fatalf("unexpected hosts: %#v", hosts)
@@ -1192,9 +1375,6 @@ func TestDiagnosticHelpers(t *testing.T) {
 			t.Fatalf("expected iam-role to be mapped")
 		}
 		want := []string{
-			"sts.cn-north-1.amazonaws.com.cn",
-			"ec2.cn-north-1.amazonaws.com.cn",
-			"tagging.cn-north-1.amazonaws.com.cn",
 			"iam.amazonaws.com.cn",
 		}
 		if strings.Join(hosts, ",") != strings.Join(want, ",") {
@@ -1208,9 +1388,6 @@ func TestDiagnosticHelpers(t *testing.T) {
 			t.Fatalf("expected iam-role to be mapped")
 		}
 		want := []string{
-			"sts.us-gov-west-1.amazonaws.com",
-			"ec2.us-gov-west-1.amazonaws.com",
-			"tagging.us-gov-west-1.amazonaws.com",
 			"iam.us-gov.amazonaws.com",
 		}
 		if strings.Join(hosts, ",") != strings.Join(want, ",") {
@@ -1241,6 +1418,29 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 		if endpoints[0].Source != "aws-vpc-endpoint" {
 			t.Fatalf("expected vpc endpoint source, got %#v", endpoints[0])
+		}
+	})
+
+	t.Run("prefers derived aws service endpoint metadata over duplicate configured endpoints", func(t *testing.T) {
+		endpoints, known, err := awsDiagnosticEndpointsForCheck(
+			"aws.s3",
+			[]string{"eu-west-1"},
+			[]string{"https://s3.eu-west-1.amazonaws.com"},
+		)
+		if err != nil {
+			t.Fatalf("unexpected endpoint parse error: %v", err)
+		}
+		if !known {
+			t.Fatalf("expected s3 to be mapped")
+		}
+		if len(endpoints) != 1 {
+			t.Fatalf("expected duplicate endpoint to compact to one entry, got %#v", endpoints)
+		}
+		if endpoints[0].Source != "aws-service" {
+			t.Fatalf("expected derived aws-service metadata to win, got %#v", endpoints[0])
+		}
+		if endpoints[0].Service != "s3" || endpoints[0].Region != "eu-west-1" {
+			t.Fatalf("expected service/region metadata to be preserved, got %#v", endpoints[0])
 		}
 	})
 
@@ -1557,6 +1757,61 @@ func TestEvalLoopBehavior(t *testing.T) {
 		}
 		if !hasCompliantPayload || !hasNonCompliantPayload {
 			t.Fatalf("expected resource payloads to include compliant and non_compliant statuses, got %v", evaluator.calls)
+		}
+	})
+
+	t.Run("returns failure after submitting evidence for partial diagnostic warnings", func(t *testing.T) {
+		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt:          now,
+				EndedAt:            now.Add(5 * time.Millisecond),
+				ExitCode:           0,
+				Resources:          []interface{}{map[string]interface{}{"id": "bucket-1"}},
+				DiagnosticWarnings: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy inventory-aws-s3; evaluation may be partial"},
+			},
+			"check-a": {
+				StartedAt:          now,
+				EndedAt:            now.Add(20 * time.Millisecond),
+				ExitCode:           0,
+				Resources:          []interface{}{},
+				DiagnosticWarnings: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy check-a; evaluation may be partial"},
+			},
+		}}
+
+		evaluator := &fakePolicyEvaluator{}
+		apiHelper := &fakeAPIHelper{}
+
+		plugin := &CloudCustodianPlugin{
+			Logger: hclog.NewNullLogger(),
+			parsedConfig: &ParsedConfig{
+				PolicyLabels: map[string]string{},
+				CheckTimeout: 30 * time.Second,
+			},
+			checks: []CustodianCheck{
+				{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+			},
+			executor:  executor,
+			evaluator: evaluator,
+		}
+
+		resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+		if err == nil {
+			t.Fatalf("expected eval failure to capture diagnostic execution errors")
+		}
+		if resp.GetStatus() != proto.ExecutionStatus_FAILURE {
+			t.Fatalf("expected failure status, got %s", resp.GetStatus().String())
+		}
+		if apiHelper.calls != 1 {
+			t.Fatalf("expected CreateEvidence once before returning diagnostic failure, got %d", apiHelper.calls)
+		}
+		if len(apiHelper.evidence) == 0 {
+			t.Fatalf("expected evidence to be submitted before diagnostic failure is returned")
+		}
+		if len(evaluator.calls) == 0 {
+			t.Fatalf("expected evaluator to run for available diagnostic endpoints")
+		}
+		if !strings.Contains(err.Error(), "s3.eu-west-1") {
+			t.Fatalf("expected diagnostic warning detail, got %v", err)
 		}
 	})
 

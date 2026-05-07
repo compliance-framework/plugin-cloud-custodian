@@ -306,18 +306,19 @@ type CustodianExecutionRequest struct {
 
 // CustodianExecutionResult captures runtime output and artifacts from one check run.
 type CustodianExecutionResult struct {
-	StartedAt     time.Time
-	EndedAt       time.Time
-	ExitCode      int
-	Stdout        string
-	Stderr        string
-	Error         string
-	Errors        []string
-	Err           error
-	Resources     []interface{}
-	ArtifactPath  string
-	ResourcesPath string
-	LogPaths      []string
+	StartedAt          time.Time
+	EndedAt            time.Time
+	ExitCode           int
+	Stdout             string
+	Stderr             string
+	Error              string
+	Errors             []string
+	Err                error
+	Resources          []interface{}
+	ArtifactPath       string
+	ResourcesPath      string
+	LogPaths           []string
+	DiagnosticWarnings []string
 }
 
 // CustodianExecutor runs one Cloud Custodian check and captures execution artifacts.
@@ -434,6 +435,52 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	runCtx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 
+	regions := req.AWSRegions
+	if strings.EqualFold(req.Check.Provider, "aws") {
+		// Ensure AWS policies evaluate across all regions by default while
+		// allowing operators to narrow problematic service/region scans.
+		if len(regions) == 0 {
+			regions = []string{"all"}
+		}
+	}
+	if req.NetworkDiagnostics && strings.EqualFold(req.Check.Provider, "aws") {
+		diagnostics, diagErr := e.runAWSEndpointDiagnostics(runCtx, req)
+		result.DiagnosticWarnings = append(result.DiagnosticWarnings, diagnostics.executionWarnings(req.Check)...)
+		if diagErr != nil {
+			result.Err = fmt.Errorf("aws endpoint network diagnostics failed: %w", diagErr)
+			result.Errors = []string{result.Err.Error()}
+			result.Error = executionErrorString(result)
+			result.EndedAt = time.Now().UTC()
+			e.Logger.Error("Skipping custodian command because AWS endpoint diagnostics failed", "check_name", req.Check.Name, "error", result.Error)
+			return result
+		}
+		if availableRegions, ok := diagnostics.availableAWSRegions(regions); ok {
+			if len(availableRegions) == 0 {
+				result.Err = fmt.Errorf("cloud custodian policy %s could not be checked because no AWS service endpoints were reachable for resource %s in requested regions %s", req.Check.Name, req.Check.Resource, strings.Join(regions, ","))
+				result.Errors = append([]string{result.Err.Error()}, result.Errors...)
+				result.Error = executionErrorString(result)
+				e.Logger.Warn("Skipping custodian command because no AWS service endpoints were reachable for policy",
+					"check_name", req.Check.Name,
+					"resource", req.Check.Resource,
+					"aws_regions", regions,
+					"unavailable_endpoint_count", len(diagnostics.Failures),
+				)
+				result.EndedAt = time.Now().UTC()
+				return result
+			}
+			if !slices.Equal(regions, availableRegions) {
+				e.Logger.Warn("Running custodian command only for AWS regions with reachable service endpoints",
+					"check_name", req.Check.Name,
+					"resource", req.Check.Resource,
+					"requested_aws_regions", regions,
+					"available_aws_regions", availableRegions,
+					"unavailable_endpoint_count", len(diagnostics.Failures),
+				)
+				regions = availableRegions
+			}
+		}
+	}
+
 	args := []string{"run"}
 	if req.Debug {
 		args = append(args, "--debug")
@@ -443,24 +490,8 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	}
 	args = append(args, "--dryrun", "-s", req.OutputDir, policyPath)
 	if strings.EqualFold(req.Check.Provider, "aws") {
-		// Ensure AWS policies evaluate across all regions by default while
-		// allowing operators to narrow problematic service/region scans.
-		regions := req.AWSRegions
-		if len(regions) == 0 {
-			regions = []string{"all"}
-		}
 		for _, region := range regions {
 			args = append(args, "--region", region)
-		}
-	}
-	if req.NetworkDiagnostics && strings.EqualFold(req.Check.Provider, "aws") {
-		if diagErr := e.runAWSEndpointDiagnostics(runCtx, req); diagErr != nil {
-			result.Err = fmt.Errorf("aws endpoint network diagnostics failed: %w", diagErr)
-			result.Error = result.Err.Error()
-			result.Errors = []string{result.Error}
-			result.EndedAt = time.Now().UTC()
-			e.Logger.Error("Skipping custodian command because AWS endpoint diagnostics failed", "check_name", req.Check.Name, "error", result.Error)
-			return result
 		}
 	}
 	cmd := exec.CommandContext(runCtx, req.BinaryPath, args...)
@@ -650,7 +681,7 @@ commandFinished:
 	}
 
 	if result.Err != nil {
-		result.Error = strings.Join(result.Errors, "; ")
+		result.Error = executionErrorString(result)
 		e.Logger.Warn("Custodian execution completed with errors",
 			"check_name", req.Check.Name,
 			"error_count", len(result.Errors),
@@ -784,40 +815,83 @@ type networkDiagnosticEndpoint struct {
 	Port       string
 	ServerName string
 	Source     string
+	Service    string
+	Region     string
 }
 
-func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context, req CustodianExecutionRequest) error {
+type awsEndpointDiagnosticFailure struct {
+	Endpoint networkDiagnosticEndpoint
+	Stage    string
+	Err      error
+}
+
+type awsEndpointDiagnosticResult struct {
+	Failures             []awsEndpointDiagnosticFailure
+	regionProbeSucceeded map[string]bool
+	regionProbeFailed    map[string]bool
+}
+
+func (r awsEndpointDiagnosticResult) availableAWSRegions(regions []string) ([]string, bool) {
+	if len(r.regionProbeSucceeded) == 0 && len(r.regionProbeFailed) == 0 {
+		return nil, false
+	}
+	available := make([]string, 0, len(regions))
+	for _, region := range regions {
+		region = strings.TrimSpace(region)
+		if region == "" || strings.EqualFold(region, "all") {
+			continue
+		}
+		if r.regionProbeSucceeded[region] && !r.regionProbeFailed[region] {
+			available = append(available, region)
+		}
+	}
+	return available, true
+}
+
+func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context, req CustodianExecutionRequest) (awsEndpointDiagnosticResult, error) {
+	result := awsEndpointDiagnosticResult{
+		Failures:             []awsEndpointDiagnosticFailure{},
+		regionProbeSucceeded: map[string]bool{},
+		regionProbeFailed:    map[string]bool{},
+	}
 	endpoints, knownResource, endpointErr := awsDiagnosticEndpointsForCheck(req.Check.Resource, req.AWSRegions, req.NetworkDiagnosticEndpoints)
 	if endpointErr != nil {
 		e.Logger.Error("AWS endpoint diagnostics configuration is invalid", "check_name", req.Check.Name, "resource", req.Check.Resource, "error", endpointErr)
-		return endpointErr
+		return result, endpointErr
 	}
 	if !knownResource && len(endpoints) == 0 {
-		err := fmt.Errorf("resource service is not mapped for AWS endpoint diagnostics: %s", req.Check.Resource)
-		e.Logger.Error("AWS endpoint diagnostics failed before custodian execution", "check_name", req.Check.Name, "resource", req.Check.Resource, "error", err)
-		return err
+		e.Logger.Warn("Skipping AWS endpoint diagnostics because resource service is not mapped and no explicit endpoints are configured", "check_name", req.Check.Name, "resource", req.Check.Resource)
+		return result, nil
 	}
 	if len(endpoints) == 0 {
 		e.Logger.Warn("Skipping AWS endpoint diagnostics because no concrete endpoint hosts are available; configure aws_regions or custodian_network_diagnostic_endpoints for preflight probes", "check_name", req.Check.Name, "resource", req.Check.Resource, "aws_regions", req.AWSRegions)
-		return nil
+		return result, nil
 	}
 	if !knownResource {
 		e.Logger.Warn("AWS endpoint diagnostics will use only configured endpoints because resource service is not mapped", "check_name", req.Check.Name, "resource", req.Check.Resource)
 	}
 
-	var diagnosticsErr error
 	for _, endpoint := range endpoints {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(diagnosticsErr, err)
+			return result, err
 		}
 		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		lookupStarted := time.Now()
 		ips, err := lookupHost(lookupCtx, endpoint.Host)
 		cancel()
 		if err != nil {
-			probeErr := fmt.Errorf("DNS lookup failed for %s endpoint %s: %w", endpoint.Source, endpoint.Host, err)
-			diagnosticsErr = errors.Join(diagnosticsErr, probeErr)
-			e.Logger.Warn("AWS endpoint DNS lookup failed", "check_name", req.Check.Name, "host", endpoint.Host, "source", endpoint.Source, "elapsed", time.Since(lookupStarted).Round(time.Millisecond).String(), "error", err)
+			result.recordFailure(endpoint, "DNS lookup", err)
+			e.Logger.Warn("AWS endpoint diagnostics detected an unreachable service endpoint; evaluation may be partial",
+				"check_name", req.Check.Name,
+				"resource", req.Check.Resource,
+				"service", endpoint.Service,
+				"region", endpoint.Region,
+				"host", endpoint.Host,
+				"stage", "DNS lookup",
+				"source", endpoint.Source,
+				"elapsed", time.Since(lookupStarted).Round(time.Millisecond).String(),
+				"error", err,
+			)
 			continue
 		} else {
 			e.Logger.Info("AWS endpoint DNS lookup succeeded", "check_name", req.Check.Name, "host", endpoint.Host, "source", endpoint.Source, "ips", ips, "elapsed", time.Since(lookupStarted).Round(time.Millisecond).String())
@@ -826,14 +900,90 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		tlsStarted := time.Now()
 		tlsResult, err := tlsProbeEndpoint(ctx, endpoint)
 		if err != nil {
-			probeErr := fmt.Errorf("TLS handshake failed for %s endpoint %s:%s: %w", endpoint.Source, endpoint.Host, endpoint.Port, err)
-			diagnosticsErr = errors.Join(diagnosticsErr, probeErr)
-			e.Logger.Warn("AWS endpoint TLS probe failed", "check_name", req.Check.Name, "host", endpoint.Host, "port", endpoint.Port, "server_name", endpoint.ServerName, "source", endpoint.Source, "elapsed", time.Since(tlsStarted).Round(time.Millisecond).String(), "error", err)
+			result.recordFailure(endpoint, "TLS handshake", err)
+			e.Logger.Warn("AWS endpoint diagnostics detected an unreachable service endpoint; evaluation may be partial",
+				"check_name", req.Check.Name,
+				"resource", req.Check.Resource,
+				"service", endpoint.Service,
+				"region", endpoint.Region,
+				"host", endpoint.Host,
+				"stage", "TLS handshake",
+				"port", endpoint.Port,
+				"server_name", endpoint.ServerName,
+				"source", endpoint.Source,
+				"elapsed", time.Since(tlsStarted).Round(time.Millisecond).String(),
+				"error", err,
+			)
 			continue
+		}
+		if endpoint.Source == "aws-service" && endpoint.Region != "" {
+			if result.regionProbeSucceeded == nil {
+				result.regionProbeSucceeded = map[string]bool{}
+			}
+			result.regionProbeSucceeded[endpoint.Region] = true
 		}
 		e.Logger.Info("AWS endpoint TLS probe succeeded", "check_name", req.Check.Name, "host", endpoint.Host, "port", endpoint.Port, "server_name", endpoint.ServerName, "source", endpoint.Source, "remote_addr", tlsResult.RemoteAddr, "tls_version", tlsResult.TLSVersion, "elapsed", time.Since(tlsStarted).Round(time.Millisecond).String())
 	}
-	return diagnosticsErr
+	return result, nil
+}
+
+func (r *awsEndpointDiagnosticResult) recordFailure(endpoint networkDiagnosticEndpoint, stage string, err error) {
+	if r.regionProbeFailed == nil {
+		r.regionProbeFailed = map[string]bool{}
+	}
+	r.Failures = append(r.Failures, awsEndpointDiagnosticFailure{
+		Endpoint: endpoint,
+		Stage:    stage,
+		Err:      err,
+	})
+	if endpoint.Source == "aws-service" && endpoint.Region != "" {
+		r.regionProbeFailed[endpoint.Region] = true
+	}
+}
+
+func (r awsEndpointDiagnosticResult) executionWarnings(check CustodianCheck) []string {
+	if len(r.Failures) == 0 {
+		return nil
+	}
+	messages := make([]string, 0, len(r.Failures))
+	for _, failure := range r.Failures {
+		endpoint := failure.Endpoint
+		service := endpoint.Service
+		if service == "" {
+			service = endpoint.Source
+		}
+		region := endpoint.Region
+		if region == "" {
+			region = "global"
+		}
+		messages = append(messages, fmt.Sprintf(
+			"unreachable AWS service endpoint %s.%s (%s:%s) detected while evaluating cloud custodian policy %s; evaluation may be partial: %s failed: %v",
+			service,
+			region,
+			endpoint.Host,
+			endpoint.Port,
+			check.Name,
+			failure.Stage,
+			failure.Err,
+		))
+	}
+	return messages
+}
+
+func executionErrorString(result CustodianExecutionResult) string {
+	messages := make([]string, 0, len(result.Errors)+len(result.DiagnosticWarnings))
+	seen := map[string]bool{}
+	for _, values := range [][]string{result.Errors, result.DiagnosticWarnings} {
+		for _, message := range values {
+			message = strings.TrimSpace(message)
+			if message == "" || seen[message] {
+				continue
+			}
+			messages = append(messages, message)
+			seen[message] = true
+		}
+	}
+	return strings.Join(messages, "; ")
 }
 
 func awsEndpointHostsForCheck(resource string, regions []string) ([]string, bool) {
@@ -877,11 +1027,17 @@ func awsDiagnosticEndpointsForCheck(resource string, regions []string, configure
 	for _, region := range diagnosticRegions {
 		for _, service := range services {
 			host := awsServiceEndpointHost(service, region)
+			endpointRegion := region
+			if _, ok := awsGlobalEndpointServices[service]; ok {
+				endpointRegion = ""
+			}
 			endpoints = append(endpoints, networkDiagnosticEndpoint{
 				Host:       host,
 				Port:       "443",
 				ServerName: host,
 				Source:     "aws-service",
+				Service:    service,
+				Region:     endpointRegion,
 			})
 		}
 	}
@@ -960,14 +1116,20 @@ func networkDiagnosticEndpointSource(host string) string {
 }
 
 func compactUniqueNetworkDiagnosticEndpoints(values []networkDiagnosticEndpoint) []networkDiagnosticEndpoint {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	result := make([]networkDiagnosticEndpoint, 0, len(values))
 	for _, value := range values {
 		key := strings.ToLower(net.JoinHostPort(value.Host, value.Port))
-		if value.Host == "" || value.Port == "" || seen[key] {
+		if value.Host == "" || value.Port == "" {
 			continue
 		}
-		seen[key] = true
+		if existingIndex, ok := seen[key]; ok {
+			if result[existingIndex].Source != "aws-service" && value.Source == "aws-service" {
+				result[existingIndex] = value
+			}
+			continue
+		}
+		seen[key] = len(result)
 		result = append(result, value)
 	}
 	return result
@@ -1015,7 +1177,7 @@ func awsServicesForResource(resource string) ([]string, bool) {
 	if !ok {
 		return nil, false
 	}
-	return compactUniqueStrings(append([]string{"sts", "ec2", "tagging"}, services...)), true
+	return compactUniqueStrings(services), true
 }
 
 func tlsVersionString(version uint16) string {
@@ -1387,6 +1549,7 @@ type StandardizedExecution struct {
 	Stderr     string   `json:"stderr,omitempty"`
 	Error      string   `json:"error,omitempty"`
 	Errors     []string `json:"errors,omitempty"`
+	Warnings   []string `json:"warnings,omitempty"`
 }
 
 // StandardizedResourcePayload is the per-resource OPA input contract.
@@ -1498,6 +1661,10 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 	if len(execution.Errors) > 0 {
 		executionErrors = append([]string{}, execution.Errors...)
 	}
+	var executionWarnings []string
+	if len(execution.DiagnosticWarnings) > 0 {
+		executionWarnings = append([]string{}, execution.DiagnosticWarnings...)
+	}
 
 	return StandardizedExecution{
 		Status:     status,
@@ -1510,6 +1677,7 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 		Stderr:     execution.Stderr,
 		Error:      execution.Error,
 		Errors:     executionErrors,
+		Warnings:   executionWarnings,
 	}
 }
 
@@ -2298,6 +2466,15 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	p.Logger.Debug("Created temporary execution root", "execution_root", executionRoot)
 
 	baselines := p.collectInventoryBaselines(ctx, executionRoot)
+	for resourceType, baseline := range baselines {
+		if baseline == nil || baseline.Err != nil || len(baseline.Execution.DiagnosticWarnings) == 0 {
+			continue
+		}
+		err := formatExecutionDiagnosticWarnings(baseline.Execution.DiagnosticWarnings)
+		p.Logger.Warn("Inventory baseline completed with unavailable AWS service endpoints", "resource", resourceType, "error", err)
+		accumulatedErrors = errors.Join(accumulatedErrors, err)
+		hadCheckExecutionFailures = true
+	}
 	for _, check := range p.checks {
 		p.Logger.Debug("Processing check", "check_name", check.Name, "check_index", check.Index, "resource", check.Resource, "provider", check.Provider)
 		if len(check.ParseErrors) > 0 {
@@ -2392,6 +2569,12 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 				}
 				pendingEvidences = pendingEvidences[evidenceBatchSize:]
 			}
+		}
+		if len(execution.DiagnosticWarnings) > 0 {
+			err := formatExecutionDiagnosticWarnings(execution.DiagnosticWarnings)
+			p.Logger.Warn("Check completed with unavailable AWS service endpoints", "check_name", check.Name, "error", err)
+			accumulatedErrors = errors.Join(accumulatedErrors, err)
+			hadCheckExecutionFailures = true
 		}
 	}
 
@@ -3013,6 +3196,18 @@ func formatExecutionFailure(checkName string, execution CustodianExecutionResult
 	default:
 		return fmt.Errorf("custodian policy execution failed for check %s", checkName)
 	}
+}
+
+func formatExecutionDiagnosticWarnings(messages []string) error {
+	var err error
+	for _, message := range messages {
+		message = strings.TrimSpace(message)
+		if message == "" {
+			continue
+		}
+		err = errors.Join(err, fmt.Errorf("custodian policy execution warning: %s", message))
+	}
+	return err
 }
 
 func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePayload) {
