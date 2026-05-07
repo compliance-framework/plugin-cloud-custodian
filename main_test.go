@@ -572,8 +572,8 @@ printf '[]' > "$out/test-policy/resources.json"
 		if _, err := os.Stat(executedFile); err != nil {
 			t.Fatalf("expected custodian command to execute, stat err: %v", err)
 		}
-		if len(result.DiagnosticErrors) != 1 || !strings.Contains(result.DiagnosticErrors[0], "handshake failed") {
-			t.Fatalf("expected diagnostic warning to be captured, got %#v", result.DiagnosticErrors)
+		if len(result.DiagnosticWarnings) != 1 || !strings.Contains(result.DiagnosticWarnings[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning to be captured, got %#v", result.DiagnosticWarnings)
 		}
 		if len(result.Errors) != 0 {
 			t.Fatalf("did not expect successful execution warnings to be surfaced as errors, got %#v", result.Errors)
@@ -694,8 +694,8 @@ printf '[]' > "$out/test-policy/resources.json"
 		if result.Err != nil {
 			t.Fatalf("expected successful execution, got error: %v", result.Err)
 		}
-		if len(result.DiagnosticErrors) != 1 || !strings.Contains(result.DiagnosticErrors[0], "s3.eu-west-2.amazonaws.com") {
-			t.Fatalf("expected unavailable region diagnostic error, got %#v", result.DiagnosticErrors)
+		if len(result.DiagnosticWarnings) != 1 || !strings.Contains(result.DiagnosticWarnings[0], "s3.eu-west-2.amazonaws.com") {
+			t.Fatalf("expected unavailable region diagnostic warning, got %#v", result.DiagnosticWarnings)
 		}
 
 		argsContent, err := os.ReadFile(argsFile)
@@ -750,8 +750,8 @@ touch "$EXECUTED_FILE"
 		if !strings.Contains(result.Error, "no AWS service endpoints were reachable") {
 			t.Fatalf("expected all-unavailable error detail, got %q", result.Error)
 		}
-		if len(result.DiagnosticErrors) != 2 {
-			t.Fatalf("expected both unavailable endpoint diagnostics, got %#v", result.DiagnosticErrors)
+		if len(result.DiagnosticWarnings) != 2 {
+			t.Fatalf("expected both unavailable endpoint diagnostics, got %#v", result.DiagnosticWarnings)
 		}
 		if _, err := os.Stat(executedFile); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected custodian command not to execute, stat err: %v", err)
@@ -1421,6 +1421,29 @@ func TestDiagnosticHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("prefers derived aws service endpoint metadata over duplicate configured endpoints", func(t *testing.T) {
+		endpoints, known, err := awsDiagnosticEndpointsForCheck(
+			"aws.s3",
+			[]string{"eu-west-1"},
+			[]string{"https://s3.eu-west-1.amazonaws.com"},
+		)
+		if err != nil {
+			t.Fatalf("unexpected endpoint parse error: %v", err)
+		}
+		if !known {
+			t.Fatalf("expected s3 to be mapped")
+		}
+		if len(endpoints) != 1 {
+			t.Fatalf("expected duplicate endpoint to compact to one entry, got %#v", endpoints)
+		}
+		if endpoints[0].Source != "aws-service" {
+			t.Fatalf("expected derived aws-service metadata to win, got %#v", endpoints[0])
+		}
+		if endpoints[0].Service != "s3" || endpoints[0].Region != "eu-west-1" {
+			t.Fatalf("expected service/region metadata to be preserved, got %#v", endpoints[0])
+		}
+	})
+
 	t.Run("uses strict vpc endpoint suffix classification", func(t *testing.T) {
 		if got := networkDiagnosticEndpointSource("evil.vpce.amazonaws.com.attacker.com"); got != "configured" {
 			t.Fatalf("expected attacker suffix not to be classified as vpc endpoint, got %s", got)
@@ -1737,21 +1760,21 @@ func TestEvalLoopBehavior(t *testing.T) {
 		}
 	})
 
-	t.Run("returns failure after submitting evidence for partial diagnostic errors", func(t *testing.T) {
+	t.Run("returns failure after submitting evidence for partial diagnostic warnings", func(t *testing.T) {
 		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
 			"inventory-aws-s3": {
-				StartedAt:        now,
-				EndedAt:          now.Add(5 * time.Millisecond),
-				ExitCode:         0,
-				Resources:        []interface{}{map[string]interface{}{"id": "bucket-1"}},
-				DiagnosticErrors: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy inventory-aws-s3; evaluation may be partial"},
+				StartedAt:          now,
+				EndedAt:            now.Add(5 * time.Millisecond),
+				ExitCode:           0,
+				Resources:          []interface{}{map[string]interface{}{"id": "bucket-1"}},
+				DiagnosticWarnings: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy inventory-aws-s3; evaluation may be partial"},
 			},
 			"check-a": {
-				StartedAt:        now,
-				EndedAt:          now.Add(20 * time.Millisecond),
-				ExitCode:         0,
-				Resources:        []interface{}{},
-				DiagnosticErrors: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy check-a; evaluation may be partial"},
+				StartedAt:          now,
+				EndedAt:            now.Add(20 * time.Millisecond),
+				ExitCode:           0,
+				Resources:          []interface{}{},
+				DiagnosticWarnings: []string{"unreachable AWS service endpoint s3.eu-west-1 detected while evaluating cloud custodian policy check-a; evaluation may be partial"},
 			},
 		}}
 
@@ -1788,7 +1811,7 @@ func TestEvalLoopBehavior(t *testing.T) {
 			t.Fatalf("expected evaluator to run for available diagnostic endpoints")
 		}
 		if !strings.Contains(err.Error(), "s3.eu-west-1") {
-			t.Fatalf("expected diagnostic error detail, got %v", err)
+			t.Fatalf("expected diagnostic warning detail, got %v", err)
 		}
 	})
 

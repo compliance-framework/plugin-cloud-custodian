@@ -306,19 +306,19 @@ type CustodianExecutionRequest struct {
 
 // CustodianExecutionResult captures runtime output and artifacts from one check run.
 type CustodianExecutionResult struct {
-	StartedAt        time.Time
-	EndedAt          time.Time
-	ExitCode         int
-	Stdout           string
-	Stderr           string
-	Error            string
-	Errors           []string
-	Err              error
-	Resources        []interface{}
-	ArtifactPath     string
-	ResourcesPath    string
-	LogPaths         []string
-	DiagnosticErrors []string
+	StartedAt          time.Time
+	EndedAt            time.Time
+	ExitCode           int
+	Stdout             string
+	Stderr             string
+	Error              string
+	Errors             []string
+	Err                error
+	Resources          []interface{}
+	ArtifactPath       string
+	ResourcesPath      string
+	LogPaths           []string
+	DiagnosticWarnings []string
 }
 
 // CustodianExecutor runs one Cloud Custodian check and captures execution artifacts.
@@ -445,7 +445,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	}
 	if req.NetworkDiagnostics && strings.EqualFold(req.Check.Provider, "aws") {
 		diagnostics, diagErr := e.runAWSEndpointDiagnostics(runCtx, req)
-		result.DiagnosticErrors = append(result.DiagnosticErrors, diagnostics.executionErrors(req.Check)...)
+		result.DiagnosticWarnings = append(result.DiagnosticWarnings, diagnostics.executionWarnings(req.Check)...)
 		if diagErr != nil {
 			result.Err = fmt.Errorf("aws endpoint network diagnostics failed: %w", diagErr)
 			result.Errors = []string{result.Err.Error()}
@@ -941,7 +941,7 @@ func (r *awsEndpointDiagnosticResult) recordFailure(endpoint networkDiagnosticEn
 	}
 }
 
-func (r awsEndpointDiagnosticResult) executionErrors(check CustodianCheck) []string {
+func (r awsEndpointDiagnosticResult) executionWarnings(check CustodianCheck) []string {
 	if len(r.Failures) == 0 {
 		return nil
 	}
@@ -971,9 +971,9 @@ func (r awsEndpointDiagnosticResult) executionErrors(check CustodianCheck) []str
 }
 
 func executionErrorString(result CustodianExecutionResult) string {
-	messages := make([]string, 0, len(result.Errors)+len(result.DiagnosticErrors))
+	messages := make([]string, 0, len(result.Errors)+len(result.DiagnosticWarnings))
 	seen := map[string]bool{}
-	for _, values := range [][]string{result.Errors, result.DiagnosticErrors} {
+	for _, values := range [][]string{result.Errors, result.DiagnosticWarnings} {
 		for _, message := range values {
 			message = strings.TrimSpace(message)
 			if message == "" || seen[message] {
@@ -1116,14 +1116,20 @@ func networkDiagnosticEndpointSource(host string) string {
 }
 
 func compactUniqueNetworkDiagnosticEndpoints(values []networkDiagnosticEndpoint) []networkDiagnosticEndpoint {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	result := make([]networkDiagnosticEndpoint, 0, len(values))
 	for _, value := range values {
 		key := strings.ToLower(net.JoinHostPort(value.Host, value.Port))
-		if value.Host == "" || value.Port == "" || seen[key] {
+		if value.Host == "" || value.Port == "" {
 			continue
 		}
-		seen[key] = true
+		if existingIndex, ok := seen[key]; ok {
+			if result[existingIndex].Source != "aws-service" && value.Source == "aws-service" {
+				result[existingIndex] = value
+			}
+			continue
+		}
+		seen[key] = len(result)
 		result = append(result, value)
 	}
 	return result
@@ -1656,8 +1662,8 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 		executionErrors = append([]string{}, execution.Errors...)
 	}
 	var executionWarnings []string
-	if len(execution.DiagnosticErrors) > 0 {
-		executionWarnings = append([]string{}, execution.DiagnosticErrors...)
+	if len(execution.DiagnosticWarnings) > 0 {
+		executionWarnings = append([]string{}, execution.DiagnosticWarnings...)
 	}
 
 	return StandardizedExecution{
@@ -2461,10 +2467,10 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 
 	baselines := p.collectInventoryBaselines(ctx, executionRoot)
 	for resourceType, baseline := range baselines {
-		if baseline == nil || baseline.Err != nil || len(baseline.Execution.DiagnosticErrors) == 0 {
+		if baseline == nil || baseline.Err != nil || len(baseline.Execution.DiagnosticWarnings) == 0 {
 			continue
 		}
-		err := formatExecutionDiagnosticErrors(baseline.Execution.DiagnosticErrors)
+		err := formatExecutionDiagnosticWarnings(baseline.Execution.DiagnosticWarnings)
 		p.Logger.Warn("Inventory baseline completed with unavailable AWS service endpoints", "resource", resourceType, "error", err)
 		accumulatedErrors = errors.Join(accumulatedErrors, err)
 		hadCheckExecutionFailures = true
@@ -2564,8 +2570,8 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 				pendingEvidences = pendingEvidences[evidenceBatchSize:]
 			}
 		}
-		if len(execution.DiagnosticErrors) > 0 {
-			err := formatExecutionDiagnosticErrors(execution.DiagnosticErrors)
+		if len(execution.DiagnosticWarnings) > 0 {
+			err := formatExecutionDiagnosticWarnings(execution.DiagnosticWarnings)
 			p.Logger.Warn("Check completed with unavailable AWS service endpoints", "check_name", check.Name, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
 			hadCheckExecutionFailures = true
@@ -3192,7 +3198,7 @@ func formatExecutionFailure(checkName string, execution CustodianExecutionResult
 	}
 }
 
-func formatExecutionDiagnosticErrors(messages []string) error {
+func formatExecutionDiagnosticWarnings(messages []string) error {
 	var err error
 	for _, message := range messages {
 		message = strings.TrimSpace(message)
