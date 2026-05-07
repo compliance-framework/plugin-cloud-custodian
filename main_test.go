@@ -577,6 +577,48 @@ printf '[]' > "$out/test-policy/resources.json"
 		}
 	})
 
+	t.Run("network diagnostics warnings are included when custodian execution fails", func(t *testing.T) {
+		stubNetworkDiagnostics(
+			t,
+			func(ctx context.Context, host string) ([]string, error) {
+				return []string{"10.0.0.10"}, nil
+			},
+			func(ctx context.Context, endpoint networkDiagnosticEndpoint) (tlsProbeResult, error) {
+				return tlsProbeResult{}, errors.New("handshake failed")
+			},
+		)
+
+		script := `#!/bin/sh
+set -eu
+exit 7
+`
+		binary := writeExecutableScript(t, script)
+		executor := &CommandCustodianExecutor{Logger: hclog.NewNullLogger()}
+
+		result := executor.Execute(context.Background(), CustodianExecutionRequest{
+			BinaryPath: binary,
+			Check: CustodianCheck{
+				Name:      "test-policy",
+				Resource:  "aws.backup-vault",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": "test-policy", "resource": "aws.backup-vault"},
+			},
+			Timeout:                    5 * time.Second,
+			OutputDir:                  filepath.Join(t.TempDir(), "out"),
+			NetworkDiagnostics:         true,
+			NetworkDiagnosticEndpoints: []string{"https://vpce-123.backup.eu-west-1.vpce.amazonaws.com"},
+		})
+		if result.Err == nil {
+			t.Fatalf("expected custodian execution failure")
+		}
+		if !strings.Contains(result.Error, "custodian execution failed") {
+			t.Fatalf("expected custodian execution error, got %q", result.Error)
+		}
+		if !strings.Contains(result.Error, "handshake failed") {
+			t.Fatalf("expected diagnostic warning to be included in execution error, got %q", result.Error)
+		}
+	})
+
 	t.Run("network diagnostics filters unavailable concrete aws regions", func(t *testing.T) {
 		argsFile := filepath.Join(t.TempDir(), "args.txt")
 		t.Setenv("ARGS_FILE", argsFile)

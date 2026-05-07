@@ -445,20 +445,21 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	}
 	if req.NetworkDiagnostics && strings.EqualFold(req.Check.Provider, "aws") {
 		diagnostics, diagErr := e.runAWSEndpointDiagnostics(runCtx, req)
+		result.DiagnosticErrors = append(result.DiagnosticErrors, diagnostics.executionErrors(req.Check)...)
 		if diagErr != nil {
 			result.Err = fmt.Errorf("aws endpoint network diagnostics failed: %w", diagErr)
-			result.Error = result.Err.Error()
-			result.Errors = []string{result.Error}
+			result.Errors = []string{result.Err.Error()}
+			appendDiagnosticErrorsToResult(&result)
+			result.Error = strings.Join(result.Errors, "; ")
 			result.EndedAt = time.Now().UTC()
 			e.Logger.Error("Skipping custodian command because AWS endpoint diagnostics failed", "check_name", req.Check.Name, "error", result.Error)
 			return result
 		}
-		result.DiagnosticErrors = append(result.DiagnosticErrors, diagnostics.executionErrors(req.Check)...)
 		if availableRegions, ok := diagnostics.availableAWSRegions(regions); ok {
 			if len(availableRegions) == 0 {
-				result.Errors = append(result.Errors, result.DiagnosticErrors...)
 				result.Err = fmt.Errorf("cloud custodian policy %s could not be checked because no AWS service endpoints were reachable for resource %s in requested regions %s", req.Check.Name, req.Check.Resource, strings.Join(regions, ","))
 				result.Errors = append([]string{result.Err.Error()}, result.Errors...)
+				appendDiagnosticErrorsToResult(&result)
 				result.Error = strings.Join(result.Errors, "; ")
 				e.Logger.Warn("Skipping custodian command because no AWS service endpoints were reachable for policy",
 					"check_name", req.Check.Name,
@@ -682,6 +683,7 @@ commandFinished:
 	}
 
 	if result.Err != nil {
+		appendDiagnosticErrorsToResult(&result)
 		result.Error = strings.Join(result.Errors, "; ")
 		e.Logger.Warn("Custodian execution completed with errors",
 			"check_name", req.Check.Name,
@@ -965,6 +967,24 @@ func (r awsEndpointDiagnosticResult) executionErrors(check CustodianCheck) []str
 		))
 	}
 	return messages
+}
+
+func appendDiagnosticErrorsToResult(result *CustodianExecutionResult) {
+	if result == nil || len(result.DiagnosticErrors) == 0 {
+		return
+	}
+	seen := map[string]bool{}
+	for _, message := range result.Errors {
+		seen[message] = true
+	}
+	for _, message := range result.DiagnosticErrors {
+		message = strings.TrimSpace(message)
+		if message == "" || seen[message] {
+			continue
+		}
+		result.Errors = append(result.Errors, message)
+		seen[message] = true
+	}
 }
 
 func awsEndpointHostsForCheck(resource string, regions []string) ([]string, bool) {
@@ -3167,14 +3187,14 @@ func formatExecutionFailure(checkName string, execution CustodianExecutionResult
 	}
 }
 
-func formatExecutionDiagnosticErrors(checkName string, messages []string) error {
+func formatExecutionDiagnosticErrors(_ string, messages []string) error {
 	var err error
 	for _, message := range messages {
 		message = strings.TrimSpace(message)
 		if message == "" {
 			continue
 		}
-		err = errors.Join(err, fmt.Errorf("custodian policy execution warning for check %s: %s", checkName, message))
+		err = errors.Join(err, fmt.Errorf("custodian policy execution warning: %s", message))
 	}
 	return err
 }
