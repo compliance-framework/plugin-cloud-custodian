@@ -633,6 +633,15 @@ exit 7
 		if !strings.Contains(result.Error, "handshake failed") {
 			t.Fatalf("expected diagnostic warning to be included in execution error, got %q", result.Error)
 		}
+		for _, executionError := range result.Errors {
+			if strings.Contains(executionError, "handshake failed") {
+				t.Fatalf("did not expect diagnostic warning to be classified as execution error, got %#v", result.Errors)
+			}
+		}
+		executionInfo := buildExecutionInfo(result)
+		if len(executionInfo.Warnings) != 1 || !strings.Contains(executionInfo.Warnings[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning in execution warnings, got %#v", executionInfo.Warnings)
+		}
 	})
 
 	t.Run("network diagnostics filters unavailable concrete aws regions", func(t *testing.T) {
