@@ -691,6 +691,7 @@ commandFinished:
 			"errors", result.Errors,
 		)
 	} else {
+		appendDiagnosticErrorsToResult(&result)
 		e.Logger.Debug("Custodian execution completed successfully",
 			"check_name", req.Check.Name,
 			"resource_count", len(result.Resources),

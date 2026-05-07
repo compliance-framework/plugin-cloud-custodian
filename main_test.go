@@ -575,6 +575,12 @@ printf '[]' > "$out/test-policy/resources.json"
 		if len(result.DiagnosticErrors) != 1 || !strings.Contains(result.DiagnosticErrors[0], "handshake failed") {
 			t.Fatalf("expected diagnostic warning to be captured, got %#v", result.DiagnosticErrors)
 		}
+		if len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning to be surfaced in execution errors, got %#v", result.Errors)
+		}
+		if result.Error != "" {
+			t.Fatalf("did not expect successful execution to set Error, got %q", result.Error)
+		}
 	})
 
 	t.Run("network diagnostics warnings are included when custodian execution fails", func(t *testing.T) {
