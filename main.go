@@ -691,7 +691,6 @@ commandFinished:
 			"errors", result.Errors,
 		)
 	} else {
-		appendDiagnosticErrorsToResult(&result)
 		e.Logger.Debug("Custodian execution completed successfully",
 			"check_name", req.Check.Name,
 			"resource_count", len(result.Resources),
@@ -886,7 +885,7 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		if err != nil {
 			result.recordFailure(endpoint, "DNS lookup", err)
 			e.Logger.Warn("AWS endpoint DNS lookup failed", "check_name", req.Check.Name, "host", endpoint.Host, "source", endpoint.Source, "elapsed", time.Since(lookupStarted).Round(time.Millisecond).String(), "error", err)
-			e.Logger.Warn("Cloud Custodian detected an unreachable AWS service endpoint; evaluation may be partial",
+			e.Logger.Warn("AWS endpoint diagnostics detected an unreachable service endpoint; evaluation may be partial",
 				"check_name", req.Check.Name,
 				"resource", req.Check.Resource,
 				"service", endpoint.Service,
@@ -905,7 +904,7 @@ func (e *CommandCustodianExecutor) runAWSEndpointDiagnostics(ctx context.Context
 		if err != nil {
 			result.recordFailure(endpoint, "TLS handshake", err)
 			e.Logger.Warn("AWS endpoint TLS probe failed", "check_name", req.Check.Name, "host", endpoint.Host, "port", endpoint.Port, "server_name", endpoint.ServerName, "source", endpoint.Source, "elapsed", time.Since(tlsStarted).Round(time.Millisecond).String(), "error", err)
-			e.Logger.Warn("Cloud Custodian detected an unreachable AWS service endpoint; evaluation may be partial",
+			e.Logger.Warn("AWS endpoint diagnostics detected an unreachable service endpoint; evaluation may be partial",
 				"check_name", req.Check.Name,
 				"resource", req.Check.Resource,
 				"service", endpoint.Service,
@@ -1545,6 +1544,7 @@ type StandardizedExecution struct {
 	Stderr     string   `json:"stderr,omitempty"`
 	Error      string   `json:"error,omitempty"`
 	Errors     []string `json:"errors,omitempty"`
+	Warnings   []string `json:"warnings,omitempty"`
 }
 
 // StandardizedResourcePayload is the per-resource OPA input contract.
@@ -1656,6 +1656,10 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 	if len(execution.Errors) > 0 {
 		executionErrors = append([]string{}, execution.Errors...)
 	}
+	var executionWarnings []string
+	if len(execution.DiagnosticErrors) > 0 {
+		executionWarnings = append([]string{}, execution.DiagnosticErrors...)
+	}
 
 	return StandardizedExecution{
 		Status:     status,
@@ -1668,6 +1672,7 @@ func buildExecutionInfo(execution CustodianExecutionResult) StandardizedExecutio
 		Stderr:     execution.Stderr,
 		Error:      execution.Error,
 		Errors:     executionErrors,
+		Warnings:   executionWarnings,
 	}
 }
 

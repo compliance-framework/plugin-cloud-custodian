@@ -575,11 +575,21 @@ printf '[]' > "$out/test-policy/resources.json"
 		if len(result.DiagnosticErrors) != 1 || !strings.Contains(result.DiagnosticErrors[0], "handshake failed") {
 			t.Fatalf("expected diagnostic warning to be captured, got %#v", result.DiagnosticErrors)
 		}
-		if len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "handshake failed") {
-			t.Fatalf("expected diagnostic warning to be surfaced in execution errors, got %#v", result.Errors)
+		if len(result.Errors) != 0 {
+			t.Fatalf("did not expect successful execution warnings to be surfaced as errors, got %#v", result.Errors)
 		}
 		if result.Error != "" {
 			t.Fatalf("did not expect successful execution to set Error, got %q", result.Error)
+		}
+		executionInfo := buildExecutionInfo(result)
+		if executionInfo.Status != "success" {
+			t.Fatalf("expected successful execution status, got %q", executionInfo.Status)
+		}
+		if len(executionInfo.Warnings) != 1 || !strings.Contains(executionInfo.Warnings[0], "handshake failed") {
+			t.Fatalf("expected diagnostic warning in execution warnings, got %#v", executionInfo.Warnings)
+		}
+		if len(executionInfo.Errors) != 0 {
+			t.Fatalf("did not expect diagnostic warning in execution errors, got %#v", executionInfo.Errors)
 		}
 	})
 
