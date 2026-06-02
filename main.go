@@ -3298,9 +3298,11 @@ func formatExecutionDiagnosticWarnings(messages []string) error {
 	return err
 }
 
-// custodianDiagnosticDetailCap bounds the total size of the per-execution
-// diagnostic detail appended to a zero-evidence failure error so that a policy
-// pack with many resource types can never produce an unbounded gRPC error.
+// custodianDiagnosticDetailCap bounds the size of the per-execution diagnostic
+// detail (the one-line summaries plus log/stderr tails) that
+// composeZeroEvidenceError appends. It caps only that appended detail; any
+// accumulatedErrors joined ahead of it carry their own (per-policy) content and
+// are intentionally not truncated here so genuine failures are never hidden.
 const custodianDiagnosticDetailCap = 32 * 1024
 
 // tailString returns at most the last maxBytes bytes of s.
