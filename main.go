@@ -3255,6 +3255,12 @@ func (p *CloudCustodianPlugin) warnZeroResourceBaseline(name, resource string, e
 	if execution.ExitCode != 0 || len(execution.Resources) > 0 {
 		return
 	}
+	// A baseline can exit 0 yet still carry an error (e.g. resources.json
+	// missing or unparseable). That real cause is already reported via
+	// formatExecutionFailure, so don't emit a misleading IAM/network warning.
+	if execution.Err != nil || execution.Error != "" {
+		return
+	}
 	p.Logger.Warn("Custodian inventory baseline exited successfully but returned zero resources; likely insufficient IAM read permissions or unreachable/cross-region service endpoints",
 		"name", name,
 		"resource", resource,
@@ -3374,11 +3380,22 @@ func formatExecutionDiagnosticDetail(d executionDiagnostic) string {
 func composeZeroEvidenceError(accumulatedErrors error, diagnostics []executionDiagnostic) error {
 	var sb strings.Builder
 
+	summaryOmitted := 0
 	if len(diagnostics) > 0 {
 		fmt.Fprintf(&sb, "custodian execution summary (%d execution(s)):\n", len(diagnostics))
 		for _, d := range diagnostics {
-			fmt.Fprintf(&sb, "  - %s %s [%s] exit=%d resources=%d had_error=%t\n",
+			line := fmt.Sprintf("  - %s %s [%s] exit=%d resources=%d had_error=%t\n",
 				d.name, d.resource, d.kind(), d.exitCode, d.resourceCount, d.hadError)
+			// Bound the summary too, so a very large policy pack can never grow
+			// the error past the cap.
+			if sb.Len()+len(line) > custodianDiagnosticDetailCap {
+				summaryOmitted++
+				continue
+			}
+			sb.WriteString(line)
+		}
+		if summaryOmitted > 0 {
+			fmt.Fprintf(&sb, "  ... %d more execution summary line(s) omitted to bound error size\n", summaryOmitted)
 		}
 	}
 
