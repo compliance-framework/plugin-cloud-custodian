@@ -1144,7 +1144,7 @@ exit 3
 		}
 	})
 
-	t.Run("does not read custodian log artifacts on success by default", func(t *testing.T) {
+	t.Run("captures custodian log tail on success without surfacing it as an error", func(t *testing.T) {
 		script := `#!/bin/sh
 set -eu
 out=""
@@ -1178,8 +1178,16 @@ printf '[]' > "$out/test-policy/resources.json"
 		if result.Err != nil {
 			t.Fatalf("expected successful execution, got error: %v", result.Err)
 		}
-		if len(result.LogPaths) != 0 {
-			t.Fatalf("expected successful execution not to walk log artifacts by default, got %#v", result.LogPaths)
+		// The run-log tail is now always captured so Eval can surface it on the
+		// exit-0/empty path, but a successful run must not turn it into an error.
+		if len(result.LogPaths) != 1 || !strings.HasSuffix(result.LogPaths[0], "custodian-run.log") {
+			t.Fatalf("expected custodian log path to be captured on success, got %#v", result.LogPaths)
+		}
+		if !strings.Contains(result.LogTail, "success log detail") {
+			t.Fatalf("expected custodian log tail to be captured on success, got %q", result.LogTail)
+		}
+		if result.Error != "" {
+			t.Fatalf("expected no error string on successful execution, got %q", result.Error)
 		}
 	})
 
@@ -2051,6 +2059,208 @@ func TestEvalFailsWhenInventoryBaselineErrors(t *testing.T) {
 	if apiHelper.calls != 0 {
 		t.Fatalf("expected no evidence submitted when baseline unavailable, got %d calls", apiHelper.calls)
 	}
+}
+
+func TestEvalZeroEvidenceErrorIncludesCustodianDiagnostics(t *testing.T) {
+	now := time.Now().UTC()
+
+	t.Run("all checks exit zero with empty resources surfaces per-execution log tails", func(t *testing.T) {
+		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				Stderr:    "boto3 access denied while listing buckets",
+				LogTail:   "ERROR custodian.policy AccessDenied: not authorized to perform s3:ListAllMyBuckets",
+			},
+			"inventory-aws-ec2": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy EndpointConnectionError: Could not connect to ec2.us-gov-west-1",
+			},
+			"check-a": {
+				StartedAt: now,
+				EndedAt:   now.Add(10 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy AccessDenied: not authorized to perform s3:GetBucketPolicy",
+			},
+			"check-b": {
+				StartedAt: now,
+				EndedAt:   now.Add(10 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy EndpointConnectionError: Could not connect to ec2.us-gov-west-1",
+			},
+		}}
+
+		apiHelper := &fakeAPIHelper{}
+		plugin := &CloudCustodianPlugin{
+			Logger: hclog.NewNullLogger(),
+			parsedConfig: &ParsedConfig{
+				CheckTimeout: 30 * time.Second,
+			},
+			checks: []CustodianCheck{
+				{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+				{Index: 1, Name: "check-b", Resource: "aws.ec2", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-b", "resource": "aws.ec2"}},
+			},
+			executor:  executor,
+			evaluator: &fakePolicyEvaluator{},
+		}
+
+		resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+		if err == nil {
+			t.Fatal("expected eval failure when no evidence is produced")
+		}
+		if resp.GetStatus() != proto.ExecutionStatus_FAILURE {
+			t.Fatalf("expected failure status, got %s", resp.GetStatus().String())
+		}
+		msg := err.Error()
+		if msg == "policy evaluation failed for all checks" {
+			t.Fatalf("expected enriched diagnostics, got bare generic error")
+		}
+		for _, want := range []string{
+			"check-a", "check-b", "inventory-aws-s3", "inventory-aws-ec2",
+			"exit=0", "resources=0",
+			"AccessDenied: not authorized to perform s3:ListAllMyBuckets",
+			"AccessDenied: not authorized to perform s3:GetBucketPolicy",
+			"EndpointConnectionError: Could not connect to ec2.us-gov-west-1",
+			"boto3 access denied while listing buckets",
+		} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("expected error to contain %q, got:\n%s", want, msg)
+			}
+		}
+	})
+
+	t.Run("mixed errored and empty executions includes both per-policy errors and diagnostics", func(t *testing.T) {
+		executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy AccessDenied on s3",
+			},
+			"inventory-aws-ec2": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy AccessDenied on ec2",
+			},
+			"check-a": {
+				StartedAt: now,
+				EndedAt:   now.Add(10 * time.Millisecond),
+				ExitCode:  2,
+				Error:     "custodian crashed during augmentation",
+				Err:       errors.New("custodian crashed during augmentation"),
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy traceback during augment",
+			},
+			"check-b": {
+				StartedAt: now,
+				EndedAt:   now.Add(10 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   "ERROR custodian.policy AccessDenied on ec2 describe",
+			},
+		}}
+
+		apiHelper := &fakeAPIHelper{}
+		plugin := &CloudCustodianPlugin{
+			Logger: hclog.NewNullLogger(),
+			parsedConfig: &ParsedConfig{
+				CheckTimeout: 30 * time.Second,
+			},
+			checks: []CustodianCheck{
+				{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+				{Index: 1, Name: "check-b", Resource: "aws.ec2", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-b", "resource": "aws.ec2"}},
+			},
+			executor:  executor,
+			evaluator: &fakePolicyEvaluator{},
+		}
+
+		_, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+		if err == nil {
+			t.Fatal("expected eval failure")
+		}
+		msg := err.Error()
+		// Per-policy error preserved from formatExecutionFailure.
+		if !strings.Contains(msg, "custodian crashed during augmentation") {
+			t.Fatalf("expected per-policy execution error, got:\n%s", msg)
+		}
+		// Per-execution diagnostics also present.
+		if !strings.Contains(msg, "check-b") || !strings.Contains(msg, "AccessDenied on ec2 describe") {
+			t.Fatalf("expected per-execution diagnostics for empty check, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "custodian execution summary") {
+			t.Fatalf("expected execution summary header, got:\n%s", msg)
+		}
+	})
+
+	t.Run("bounds total diagnostic size and reports omitted sections", func(t *testing.T) {
+		const checkCount = 16
+		bigTail := strings.Repeat("AccessDenied X ", 320) // ~4.8KB per execution
+		results := map[string]CustodianExecutionResult{
+			"inventory-aws-s3": {
+				StartedAt: now,
+				EndedAt:   now.Add(5 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   bigTail,
+			},
+		}
+		checks := make([]CustodianCheck, 0, checkCount)
+		for i := 0; i < checkCount; i++ {
+			name := fmt.Sprintf("check-%02d", i)
+			results[name] = CustodianExecutionResult{
+				StartedAt: now,
+				EndedAt:   now.Add(10 * time.Millisecond),
+				ExitCode:  0,
+				Resources: []interface{}{},
+				LogTail:   bigTail,
+			}
+			checks = append(checks, CustodianCheck{
+				Index:     i,
+				Name:      name,
+				Resource:  "aws.s3",
+				Provider:  "aws",
+				RawPolicy: map[string]interface{}{"name": name, "resource": "aws.s3"},
+			})
+		}
+
+		apiHelper := &fakeAPIHelper{}
+		plugin := &CloudCustodianPlugin{
+			Logger: hclog.NewNullLogger(),
+			parsedConfig: &ParsedConfig{
+				CheckTimeout: 30 * time.Second,
+			},
+			checks:    checks,
+			executor:  &fakeExecutor{results: results},
+			evaluator: &fakePolicyEvaluator{},
+		}
+
+		_, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, apiHelper)
+		if err == nil {
+			t.Fatal("expected eval failure")
+		}
+		msg := err.Error()
+		if len(msg) > custodianDiagnosticDetailCap+8*1024 {
+			t.Fatalf("expected bounded error size, got %d bytes", len(msg))
+		}
+		if !strings.Contains(msg, "omitted to bound error size") {
+			t.Fatalf("expected omitted-sections marker, got message of %d bytes:\n%s", len(msg), msg)
+		}
+		// Every execution still gets its compact one-line summary even when its
+		// full detail section was omitted.
+		if !strings.Contains(msg, "check-15") {
+			t.Fatalf("expected compact summary line for every execution, got:\n%s", msg)
+		}
+	})
 }
 
 func TestConfigureLoadsChecks(t *testing.T) {

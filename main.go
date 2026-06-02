@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -318,6 +319,7 @@ type CustodianExecutionResult struct {
 	ArtifactPath       string
 	ResourcesPath      string
 	LogPaths           []string
+	LogTail            string
 	DiagnosticWarnings []string
 }
 
@@ -507,10 +509,12 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 			e.Logger.Info("Custodian AWS API trace enabled", "check_name", req.Check.Name, "trace_log_path", traceLogPath, "pythonpath_dir", traceDir)
 		}
 	}
-	e.Logger.Debug("Executing custodian command",
+	e.Logger.Info("Executing custodian command",
 		"check_name", req.Check.Name,
+		"resource", req.Check.Resource,
 		"command", req.BinaryPath,
 		"args", args,
+		"aws_regions", regions,
 	)
 	stdoutBuf := &lockedBuffer{}
 	stderrBuf := &lockedBuffer{}
@@ -637,14 +641,14 @@ commandFinished:
 	if resources != nil {
 		result.Resources = resources
 	}
-	var logTail string
-	var logErr error
-	if req.LogTailDuringRun || err != nil || runCtx.Err() != nil || resourcesErr != nil {
-		logPaths, tail, readErr := readCustodianLogArtifacts(req.OutputDir, custodianOutputTailBytes)
-		result.LogPaths = logPaths
-		logTail = tail
-		logErr = readErr
-	}
+	// Always capture the tail of custodian's own run log, regardless of exit
+	// code or LogTailDuringRun. Custodian frequently exits 0 with an empty
+	// resources.json after logging AccessDenied / EndpointConnectionError to
+	// custodian-run.log; capturing the tail here (before the temp dir is
+	// deleted) is the only non-invasive way to surface that cause to Eval.
+	logPaths, logTail, logErr := readCustodianLogArtifacts(req.OutputDir, custodianOutputTailBytes)
+	result.LogPaths = logPaths
+	result.LogTail = logTail
 
 	if err != nil {
 		result.Err = fmt.Errorf("custodian execution failed: %w", err)
@@ -2455,8 +2459,13 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	successfulPolicyRuns := 0
 	hadCheckExecutionFailures := false
 	defer func() {
-		if p.parsedConfig.PreserveArtifacts && hadCheckExecutionFailures {
-			p.Logger.Warn("Preserving cloud custodian execution artifacts after check execution failure", "execution_root", executionRoot)
+		zeroEvidence := successfulPolicyRuns == 0 && totalEvidenceCount == 0
+		if p.parsedConfig.PreserveArtifacts && (hadCheckExecutionFailures || zeroEvidence) {
+			p.Logger.Warn("Preserving cloud custodian execution artifacts for troubleshooting",
+				"execution_root", executionRoot,
+				"had_check_execution_failures", hadCheckExecutionFailures,
+				"zero_evidence", zeroEvidence,
+			)
 			return
 		}
 		if err := os.RemoveAll(executionRoot); err != nil {
@@ -2465,9 +2474,21 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	}()
 	p.Logger.Debug("Created temporary execution root", "execution_root", executionRoot)
 
+	// Retain a compact diagnostic per execution (baselines + checks) and a
+	// per-check summary row so the zero-evidence failure branch and the
+	// consolidated end-of-run summary can explain why nothing was produced.
+	var executionDiagnostics []executionDiagnostic
+	var runSummaries []checkRunSummary
+
 	baselines := p.collectInventoryBaselines(ctx, executionRoot)
-	for resourceType, baseline := range baselines {
-		if baseline == nil || baseline.Err != nil || len(baseline.Execution.DiagnosticWarnings) == 0 {
+	for _, resourceType := range slices.Sorted(maps.Keys(baselines)) {
+		baseline := baselines[resourceType]
+		if baseline == nil {
+			continue
+		}
+		baselineName := fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType))
+		executionDiagnostics = append(executionDiagnostics, newExecutionDiagnostic(baselineName, resourceType, true, baseline.Execution, baseline.Err != nil))
+		if baseline.Err != nil || len(baseline.Execution.DiagnosticWarnings) == 0 {
 			continue
 		}
 		err := formatExecutionDiagnosticWarnings(baseline.Execution.DiagnosticWarnings)
@@ -2481,6 +2502,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			p.Logger.Warn("Skipping custodian execution due to check parse issues", "check_name", check.Name, "parse_errors", check.ParseErrors)
 			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("check %s has parse errors: %s", check.Name, strings.Join(check.ParseErrors, "; ")))
 			hadCheckExecutionFailures = true
+			runSummaries = append(runSummaries, checkRunSummary{Check: check.Name, Resource: check.Resource, ExitCode: -1, HadError: true, Regions: p.parsedConfig.AWSRegions})
 			continue
 		}
 
@@ -2495,6 +2517,11 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			p.Logger.Error("Skipping check due to unavailable inventory baseline", "check_name", check.Name, "resource", check.Resource, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
 			hadCheckExecutionFailures = true
+			baselineRecordCount := 0
+			if baseline != nil {
+				baselineRecordCount = len(baseline.Records)
+			}
+			runSummaries = append(runSummaries, checkRunSummary{Check: check.Name, Resource: check.Resource, ExitCode: -1, BaselineResourceCount: baselineRecordCount, HadError: true, Regions: p.parsedConfig.AWSRegions})
 			continue
 		}
 
@@ -2517,6 +2544,8 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			p.Logger.Error("Skipping resource evaluation due to check execution error", "check_name", check.Name, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
 			hadCheckExecutionFailures = true
+			executionDiagnostics = append(executionDiagnostics, newExecutionDiagnostic(check.Name, check.Resource, false, execution, true))
+			runSummaries = append(runSummaries, checkRunSummary{Check: check.Name, Resource: check.Resource, ExitCode: execution.ExitCode, BaselineResourceCount: len(baseline.Records), MatchedResourceCount: len(execution.Resources), HadError: true, Regions: p.parsedConfig.AWSRegions})
 			continue
 		}
 
@@ -2547,10 +2576,13 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			}
 		}
 
+		checkEvidenceCount := 0
+		checkHadError := false
 		for _, payload := range payloads {
 			evidences, evalErr, successfulRuns := p.evaluateResourcePolicies(ctx, payload, req.GetPolicyPaths())
 			pendingEvidences = append(pendingEvidences, evidences...)
 			totalEvidenceCount += len(evidences)
+			checkEvidenceCount += len(evidences)
 			successfulPolicyRuns += successfulRuns
 			p.Logger.Debug("Completed policy evaluations for resource",
 				"check_name", payload.Check.Name,
@@ -2561,6 +2593,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 				"had_eval_error", evalErr != nil,
 			)
 			if evalErr != nil {
+				checkHadError = true
 				accumulatedErrors = errors.Join(accumulatedErrors, evalErr)
 			}
 			for len(pendingEvidences) >= evidenceBatchSize {
@@ -2575,7 +2608,20 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			p.Logger.Warn("Check completed with unavailable AWS service endpoints", "check_name", check.Name, "error", err)
 			accumulatedErrors = errors.Join(accumulatedErrors, err)
 			hadCheckExecutionFailures = true
+			checkHadError = true
 		}
+		executionDiagnostics = append(executionDiagnostics, newExecutionDiagnostic(check.Name, check.Resource, false, execution, checkHadError))
+		runSummaries = append(runSummaries, checkRunSummary{
+			Check:                 check.Name,
+			Resource:              check.Resource,
+			ExitCode:              execution.ExitCode,
+			BaselineResourceCount: len(baseline.Records),
+			MatchedResourceCount:  len(execution.Resources),
+			PayloadCount:          len(payloads),
+			EvidenceCount:         checkEvidenceCount,
+			HadError:              checkHadError,
+			Regions:               p.parsedConfig.AWSRegions,
+		})
 	}
 
 	if len(pendingEvidences) > 0 {
@@ -2596,11 +2642,25 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 		p.Logger.Warn("No evidence generated by current evaluation run")
 	}
 
-	if successfulPolicyRuns == 0 && totalEvidenceCount == 0 {
-		if accumulatedErrors == nil {
-			accumulatedErrors = errors.New("policy evaluation failed for all checks")
-		}
-		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, accumulatedErrors
+	// Consolidated, one-glance picture across every resource type. Emitted at
+	// Warn when no evidence was produced, otherwise at Debug since a run that
+	// produced evidence is the healthy case.
+	zeroEvidenceOutcome := successfulPolicyRuns == 0 && totalEvidenceCount == 0
+	summaryLog := p.Logger.Debug
+	if zeroEvidenceOutcome {
+		summaryLog = p.Logger.Warn
+	}
+	summaryLog("Cloud custodian evaluation summary",
+		"check_count", len(p.checks),
+		"successful_policy_runs", successfulPolicyRuns,
+		"total_evidence_count", totalEvidenceCount,
+		"had_check_execution_failures", hadCheckExecutionFailures,
+		"aws_regions", p.parsedConfig.AWSRegions,
+		"per_check", runSummaries,
+	)
+
+	if zeroEvidenceOutcome {
+		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, composeZeroEvidenceError(accumulatedErrors, executionDiagnostics)
 	}
 	if hadCheckExecutionFailures {
 		if accumulatedErrors == nil {
@@ -2648,6 +2708,7 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 		if execution.Err != nil || execution.Error != "" {
 			baselineErr = formatExecutionFailure(check.Name, execution)
 		}
+		p.warnZeroResourceBaseline(check.Name, resourceType, execution)
 		records := make([]ResourceRecord, 0, len(execution.Resources))
 		for _, resource := range execution.Resources {
 			records = append(records, p.buildResourceRecord(resourceType, resource))
@@ -3185,6 +3246,24 @@ func isReservedResourceLabel(label string) bool {
 	}
 }
 
+// warnZeroResourceBaseline emits a Warn naming the likely causes whenever an
+// inventory baseline run exits 0 but returned no resources, so that an operator
+// can distinguish a permissions problem from a network/endpoint problem without
+// re-running with invasive tracing. This is not done for policy checks: a fully
+// compliant estate legitimately matches zero resources.
+func (p *CloudCustodianPlugin) warnZeroResourceBaseline(name, resource string, execution CustodianExecutionResult) {
+	if execution.ExitCode != 0 || len(execution.Resources) > 0 {
+		return
+	}
+	p.Logger.Warn("Custodian inventory baseline exited successfully but returned zero resources; likely insufficient IAM read permissions or unreachable/cross-region service endpoints",
+		"name", name,
+		"resource", resource,
+		"exit_code", execution.ExitCode,
+		"stderr_tail", tailString(execution.Stderr, custodianOutputTailBytes),
+		"log_tail", execution.LogTail,
+	)
+}
+
 func formatExecutionFailure(checkName string, execution CustodianExecutionResult) error {
 	switch {
 	case execution.Error != "" && execution.Err != nil:
@@ -3208,6 +3287,146 @@ func formatExecutionDiagnosticWarnings(messages []string) error {
 		err = errors.Join(err, fmt.Errorf("custodian policy execution warning: %s", message))
 	}
 	return err
+}
+
+// custodianDiagnosticDetailCap bounds the total size of the per-execution
+// diagnostic detail appended to a zero-evidence failure error so that a policy
+// pack with many resource types can never produce an unbounded gRPC error.
+const custodianDiagnosticDetailCap = 32 * 1024
+
+// tailString returns at most the last maxBytes bytes of s.
+func tailString(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	return s[len(s)-maxBytes:]
+}
+
+// executionDiagnostic is a compact, bounded snapshot of a single custodian
+// execution (an inventory baseline or a policy check) retained so that the
+// zero-evidence failure branch can explain why nothing was produced.
+type executionDiagnostic struct {
+	name          string
+	resource      string
+	isBaseline    bool
+	exitCode      int
+	resourceCount int
+	logTail       string
+	stderrTail    string
+	warnings      []string
+	hadError      bool
+}
+
+func newExecutionDiagnostic(name, resource string, isBaseline bool, execution CustodianExecutionResult, hadError bool) executionDiagnostic {
+	return executionDiagnostic{
+		name:          name,
+		resource:      resource,
+		isBaseline:    isBaseline,
+		exitCode:      execution.ExitCode,
+		resourceCount: len(execution.Resources),
+		logTail:       execution.LogTail,
+		stderrTail:    tailString(execution.Stderr, custodianOutputTailBytes),
+		warnings:      execution.DiagnosticWarnings,
+		hadError:      hadError,
+	}
+}
+
+func (d executionDiagnostic) kind() string {
+	if d.isBaseline {
+		return "baseline"
+	}
+	return "check"
+}
+
+// formatExecutionDiagnosticDetail renders the full (already capped) detail for
+// one execution: its identity, exit code, resource count, diagnostic warnings,
+// and the tails of stderr and custodian-run.log.
+func formatExecutionDiagnosticDetail(d executionDiagnostic) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n--- %s %s [%s] exit=%d resources=%d ---\n", d.name, d.resource, d.kind(), d.exitCode, d.resourceCount)
+	if len(d.warnings) > 0 {
+		sb.WriteString("diagnostic warnings:\n")
+		for _, w := range d.warnings {
+			w = strings.TrimSpace(w)
+			if w == "" {
+				continue
+			}
+			sb.WriteString("  " + w + "\n")
+		}
+	}
+	if tail := strings.TrimSpace(d.stderrTail); tail != "" {
+		sb.WriteString("stderr tail:\n")
+		sb.WriteString(tail + "\n")
+	}
+	if tail := strings.TrimSpace(d.logTail); tail != "" {
+		sb.WriteString("custodian-run.log tail:\n")
+		sb.WriteString(tail + "\n")
+	}
+	return sb.String()
+}
+
+// composeZeroEvidenceError builds the error returned when no evidence was
+// produced for any check. It preserves any accumulated per-policy/exec errors
+// and appends, for every custodian execution, a compact one-line summary plus
+// full log/stderr tails for the suspicious (zero-resource) executions. The
+// generic sentence survives only as a last-resort fallback when there is
+// genuinely nothing else to report.
+func composeZeroEvidenceError(accumulatedErrors error, diagnostics []executionDiagnostic) error {
+	var sb strings.Builder
+
+	if len(diagnostics) > 0 {
+		fmt.Fprintf(&sb, "custodian execution summary (%d execution(s)):\n", len(diagnostics))
+		for _, d := range diagnostics {
+			fmt.Fprintf(&sb, "  - %s %s [%s] exit=%d resources=%d had_error=%t\n",
+				d.name, d.resource, d.kind(), d.exitCode, d.resourceCount, d.hadError)
+		}
+	}
+
+	omitted := 0
+	for _, d := range diagnostics {
+		// Only the zero-resource executions are suspicious; emit their full
+		// tails. Executions that returned resources get the one-line summary
+		// above only, keeping the total bounded.
+		if d.resourceCount > 0 {
+			continue
+		}
+		section := formatExecutionDiagnosticDetail(d)
+		if sb.Len()+len(section) > custodianDiagnosticDetailCap {
+			omitted++
+			continue
+		}
+		sb.WriteString(section)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&sb, "\n(%d additional zero-resource diagnostic section(s) omitted to bound error size)\n", omitted)
+	}
+
+	detail := strings.TrimSpace(sb.String())
+
+	switch {
+	case detail != "" && accumulatedErrors != nil:
+		return errors.Join(accumulatedErrors, errors.New(detail))
+	case detail != "":
+		return errors.New(detail)
+	case accumulatedErrors != nil:
+		return accumulatedErrors
+	default:
+		return errors.New("policy evaluation failed for all checks")
+	}
+}
+
+// checkRunSummary is one row of the consolidated end-of-run summary emitted by
+// Eval, giving an operator a one-glance picture across every resource type.
+type checkRunSummary struct {
+	Check                 string   `json:"check"`
+	Resource              string   `json:"resource"`
+	ExitCode              int      `json:"exit_code"`
+	BaselineResourceCount int      `json:"baseline_resource_count"`
+	MatchedResourceCount  int      `json:"matched_resource_count"`
+	PayloadCount          int      `json:"payload_count"`
+	EvidenceCount         int      `json:"evidence_count"`
+	HadError              bool     `json:"had_error"`
+	Regions               []string `json:"regions,omitempty"`
 }
 
 func (p *CloudCustodianPlugin) logPolicyPayload(payload *StandardizedResourcePayload) {
