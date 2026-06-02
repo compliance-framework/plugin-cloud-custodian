@@ -2487,8 +2487,11 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 			continue
 		}
 		baselineName := fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType))
-		executionDiagnostics = append(executionDiagnostics, newExecutionDiagnostic(baselineName, resourceType, true, baseline.Execution, baseline.Err != nil))
-		if baseline.Err != nil || len(baseline.Execution.DiagnosticWarnings) == 0 {
+		// A baseline with only diagnostic warnings (e.g. unreachable endpoints)
+		// is still treated as a failure below, so reflect that in had_error.
+		baselineHadWarnings := len(baseline.Execution.DiagnosticWarnings) > 0
+		executionDiagnostics = append(executionDiagnostics, newExecutionDiagnostic(baselineName, resourceType, true, baseline.Execution, baseline.Err != nil || baselineHadWarnings))
+		if baseline.Err != nil || !baselineHadWarnings {
 			continue
 		}
 		err := formatExecutionDiagnosticWarnings(baseline.Execution.DiagnosticWarnings)
