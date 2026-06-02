@@ -569,6 +569,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 					"stdout_len", stdoutBuf.Len(),
 					"stderr_len", stderrBuf.Len(),
 				)
+				e.Logger.Debug("custodian outputs", "stdout", stdoutBuf.Tail(100), "stderr", stderrBuf.Tail(100))
 				goto commandFinished
 			case <-ticker.C:
 				elapsed := time.Since(result.StartedAt).Round(time.Second).String()
