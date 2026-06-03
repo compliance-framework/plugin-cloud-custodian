@@ -367,6 +367,15 @@ func (b *lockedBuffer) Tail(maxBytes int) string {
 	return string(content[len(content)-maxBytes:])
 }
 
+// custodianCachePath returns a writable path for c7n's resource cache file.
+// c7n defaults to ~/.cache/cloud-custodian.cache, which is unwritable when the
+// container runs with a read-only root filesystem and no writable HOME.
+// os.TempDir resolves to $TMPDIR or /tmp; the agent deployment mounts /tmp as a
+// writable emptyDir, so the cache lands somewhere always writable and ephemeral.
+func custodianCachePath() string {
+	return filepath.Join(os.TempDir(), "cloud-custodian.cache")
+}
+
 func custodianDiagnosticInterval(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
 		return custodianWatchInterval
@@ -490,7 +499,12 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	if req.Verbose {
 		args = append(args, "-v")
 	}
-	args = append(args, "--dryrun", "-s", req.OutputDir, policyPath)
+	// Pin c7n's resource cache to a writable, ephemeral location. By default
+	// c7n writes to ~/.cache/cloud-custodian.cache; with no HOME set and a
+	// read-only root filesystem that makedirs fails with "Read-only file
+	// system". os.TempDir honors TMPDIR and otherwise resolves to /tmp, which
+	// the agent deployment mounts as a writable emptyDir.
+	args = append(args, "--dryrun", "-s", req.OutputDir, "--cache", custodianCachePath(), policyPath)
 	if strings.EqualFold(req.Check.Provider, "aws") {
 		for _, region := range regions {
 			args = append(args, "--region", region)
