@@ -238,6 +238,132 @@ func TestPluginConfigParse(t *testing.T) {
 			t.Fatalf("unexpected debug output dir: %s", parsed.DebugPayloadOutputDir)
 		}
 	})
+
+	t.Run("default debug output dir is absolute under os.TempDir", func(t *testing.T) {
+		t.Setenv("TMPDIR", t.TempDir())
+		cfg := &PluginConfig{
+			PoliciesYAML:      "policies: []",
+			DebugDumpPayloads: "true",
+		}
+		parsed, err := cfg.Parse()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !filepath.IsAbs(parsed.DebugPayloadOutputDir) {
+			t.Fatalf("expected absolute default debug output dir, got %q", parsed.DebugPayloadOutputDir)
+		}
+		if parsed.DebugPayloadOutputDir != filepath.Join(os.TempDir(), "ccf-custodian-debug-payloads") {
+			t.Fatalf("expected default debug output dir under os.TempDir %q, got %q", os.TempDir(), parsed.DebugPayloadOutputDir)
+		}
+	})
+
+	t.Run("no debug output dir when dumping disabled", func(t *testing.T) {
+		parsed, err := (&PluginConfig{PoliciesYAML: "policies: []"}).Parse()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if parsed.DebugDumpPayloads || parsed.DebugPayloadOutputDir != "" {
+			t.Fatalf("expected debug dumping disabled with no dir, got %v %q", parsed.DebugDumpPayloads, parsed.DebugPayloadOutputDir)
+		}
+	})
+
+	t.Run("relative debug output dir is kept as configured", func(t *testing.T) {
+		parsed, err := (&PluginConfig{
+			PoliciesYAML:          "policies: []",
+			DebugPayloadOutputDir: "relative-debug-dir",
+		}).Parse()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !parsed.DebugDumpPayloads || parsed.DebugPayloadOutputDir != "relative-debug-dir" {
+			t.Fatalf("expected relative debug output dir to be honoured, got %v %q", parsed.DebugDumpPayloads, parsed.DebugPayloadOutputDir)
+		}
+	})
+}
+
+func TestConfigureDebugPayloadOutputDir(t *testing.T) {
+	stubLookPath(t, func(binary string) (string, error) {
+		return "/usr/local/bin/" + binary, nil
+	})
+
+	configure := func(t *testing.T, extra map[string]string) (*CloudCustodianPlugin, string) {
+		t.Helper()
+		var logs bytes.Buffer
+		plugin := &CloudCustodianPlugin{Logger: hclog.New(&hclog.LoggerOptions{
+			Name:   "test",
+			Level:  hclog.Info,
+			Output: &logs,
+		})}
+		config := map[string]string{"policies_yaml": "policies:\n  - name: s3-check\n    resource: aws.s3"}
+		for k, v := range extra {
+			config[k] = v
+		}
+		if _, err := plugin.Configure(&proto.ConfigureRequest{Config: config}); err != nil {
+			t.Fatalf("unexpected configure error: %v", err)
+		}
+		return plugin, logs.String()
+	}
+
+	t.Run("default dir is created under os.TempDir without warning", func(t *testing.T) {
+		t.Setenv("TMPDIR", t.TempDir())
+		cwd := t.TempDir()
+		t.Chdir(cwd)
+
+		plugin, logs := configure(t, map[string]string{"debug_dump_payloads": "true"})
+		want := filepath.Join(os.TempDir(), "ccf-custodian-debug-payloads")
+		if plugin.parsedConfig.DebugPayloadOutputDir != want {
+			t.Fatalf("expected default dir %q, got %q", want, plugin.parsedConfig.DebugPayloadOutputDir)
+		}
+		if info, err := os.Stat(want); err != nil || !info.IsDir() {
+			t.Fatalf("expected default debug dir to be created at %q: %v", want, err)
+		}
+		if entries, err := os.ReadDir(cwd); err != nil || len(entries) != 0 {
+			t.Fatalf("expected nothing created in the working directory, got %v (err %v)", entries, err)
+		}
+		if strings.Contains(logs, "[WARN]") {
+			t.Fatalf("expected no warning for default dir, got %q", logs)
+		}
+		if !strings.Contains(logs, "Debug payload dumping enabled") || !strings.Contains(logs, want) {
+			t.Fatalf("expected resolved debug dir to be logged, got %q", logs)
+		}
+	})
+
+	t.Run("explicit absolute dir is kept without warning", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "abs-debug")
+		plugin, logs := configure(t, map[string]string{"debug_payload_output_dir": dir})
+		if plugin.parsedConfig.DebugPayloadOutputDir != dir {
+			t.Fatalf("expected configured dir %q, got %q", dir, plugin.parsedConfig.DebugPayloadOutputDir)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("expected configured dir to be created: %v", err)
+		}
+		if strings.Contains(logs, "[WARN]") {
+			t.Fatalf("expected no warning for absolute dir, got %q", logs)
+		}
+	})
+
+	t.Run("explicit relative dir is honoured with a warning", func(t *testing.T) {
+		cwd := t.TempDir()
+		t.Chdir(cwd)
+
+		plugin, logs := configure(t, map[string]string{"debug_payload_output_dir": "relative-debug"})
+		if plugin.parsedConfig.DebugPayloadOutputDir != "relative-debug" {
+			t.Fatalf("expected relative dir to be kept, got %q", plugin.parsedConfig.DebugPayloadOutputDir)
+		}
+		if _, err := os.Stat(filepath.Join(cwd, "relative-debug")); err != nil {
+			t.Fatalf("expected relative dir to be created under the working directory: %v", err)
+		}
+		if !strings.Contains(logs, "[WARN]") || !strings.Contains(logs, "debug_payload_output_dir is relative") {
+			t.Fatalf("expected relative dir warning, got %q", logs)
+		}
+		resolved, err := filepath.Abs("relative-debug")
+		if err != nil {
+			t.Fatalf("abs: %v", err)
+		}
+		if !strings.Contains(logs, resolved) {
+			t.Fatalf("expected resolved absolute dir %q to be logged, got %q", resolved, logs)
+		}
+	})
 }
 
 func TestResolvePoliciesYAML(t *testing.T) {
