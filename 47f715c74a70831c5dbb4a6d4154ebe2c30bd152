@@ -1,0 +1,5 @@
+lisa-design:
+- Default debug_payload_output_dir is filepath.Join(os.TempDir(), "ccf-custodian-debug-payloads"), mirroring custodianCachePath(): os.TempDir honours $TMPDIR and the agent deployment mounts /tmp writable.
+- Operator-configured RELATIVE debug_payload_output_dir is kept verbatim (not rejected, not rewritten to abs) to avoid breaking existing configs; Configure logs a WARN instead. Parse() has no logger, so the warning lives in Configure next to MkdirAll.
+- "Debug payload dumping enabled" log raised Debug -> Info and prints filepath.Abs of the dir so operators can find files.
+- Deliberately did NOT set cmd.Dir for the spawned custodian process: all plugin-supplied paths (-s output dir, --cache, policy.yaml) are already absolute, but user policy content (e.g. value_from file references) may rely on relative paths resolving against the current cwd; changing it is a behavioural change outside this fix's scope.
