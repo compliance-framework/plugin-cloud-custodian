@@ -1,2 +1,5 @@
 lisa-addressed:
 - CORE-DUP-001 c4ec9d95a1b9: TestREADMEIdentityTableMatchesCode parses the README Resource Identity rows and compares them with awsResourceIdentityFields (verified it fails when a README row is edited).
+
+lisa-selfreview:
+pass 2 (strict): approve, no findings. gofmt/vet/test -race/golangci-lint (shared v1.5.2 config, vs origin/main and vs layer 4)/goreleaser check+snapshot build clean.
