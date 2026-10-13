@@ -1,0 +1,5 @@
+lisa-addressed:
+review pass 1 (#33, gusfcarvalho CHANGES_REQUESTED):
+- main.go account_name label: removed from the labels passed to the policy processor (it seeded evidence UUIDs); addAccountNameLabel adds it to the evidence after generation (policy result label wins). Init label schema and README unchanged (the label is still on evidence). Test: TestEvalAccountsEvidenceUUIDsDifferPerAccountNotPerName, TestEvalAccountsLabelsPayloadAndSubject.
+- accounts.go ambient id (CORE-INPUT-001): verifyAmbientAccount compares the use_ambient_credentials id with the 12-digit accounts in baseline record ARNs; mismatch -> scope.accountMismatch, checks skipped, account failure; none -> Warn. Test: TestEvalAccountsVerifiesTheAmbientAccount.
+- accounts.go submission error (GO-ERR-001): wrapped "AWS account <label>: submitting evidence: %w" joined with formatAccountFailures(failures, i) (i = accounts scanned before, so the summary never claims later/unsubmitted accounts' evidence was submitted). Test: TestEvalAccountsSubmissionErrorNamesEarlierFailures.
