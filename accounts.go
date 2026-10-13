@@ -29,7 +29,7 @@ var (
 	awsPartitionPattern = regexp.MustCompile(`^aws(-[a-z]+)*$`)
 	// IAM role names may carry a path (path/name); names use [\w+=,.@-].
 	awsRoleNamePattern = regexp.MustCompile(`^[A-Za-z0-9_+=,.@-]+(/[A-Za-z0-9_+=,.@-]+)*$`)
-	awsRoleARNPattern  = regexp.MustCompile(`^arn:(aws(?:-[a-z]+)*):iam::([0-9]{12}):role/(.+)$`)
+	awsRoleARNPattern  = regexp.MustCompile(`^arn:(aws(?:-[a-z]+)*):iam::([0-9]{12}):role/([A-Za-z0-9_+=,.@-]+(?:/[A-Za-z0-9_+=,.@-]+)*)$`)
 	// STS ExternalId and RoleSessionName character sets.
 	awsExternalIDPattern     = regexp.MustCompile(`^[A-Za-z0-9_+=,.@:/-]+$`)
 	awsSessionSuffixPattern  = regexp.MustCompile(`^[A-Za-z0-9_+=,.@-]+$`)

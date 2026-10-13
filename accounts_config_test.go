@@ -161,6 +161,11 @@ func TestParseAWSAccounts(t *testing.T) {
 			cfg:     PluginConfig{AWSAccounts: `[{"id": "222222222222", "role_arn": "arn:aws:iam::222222222222:user/r"}]`},
 			wantErr: "is not an IAM role ARN",
 		},
+		{
+			name:    "role_arn with characters IAM rejects",
+			cfg:     PluginConfig{AWSAccounts: `[{"id": "222222222222", "role_arn": "arn:aws:iam::222222222222:role/bad name"}]`},
+			wantErr: "is not an IAM role ARN",
+		},
 		{name: "invalid role_name", cfg: PluginConfig{AWSAccounts: `[{"id": "222222222222", "role_name": "bad name"}]`}, wantErr: "not a valid IAM role name"},
 		{
 			name:    "invalid aws_assume_role_name",
