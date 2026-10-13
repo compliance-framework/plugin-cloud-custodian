@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -216,16 +217,13 @@ func TestEvalWithoutAccountsMatchesGolden(t *testing.T) {
 	}
 	transcript := runEvalTranscript(t, plugin, &accountFakeExecutor{results: goldenScenarioResults()}, []string{"bundle-a", "bundle-b"})
 
-	got, err := json.MarshalIndent(transcript, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal transcript: %v", err)
-	}
-	goldenPath := filepath.Join("testdata", "eval_without_accounts.golden.json")
+	got := formatEvalTranscript(t, transcript)
+	goldenPath := filepath.Join("testdata", "eval_without_accounts.golden")
 	if *updateGolden {
 		if err := os.MkdirAll("testdata", 0o755); err != nil {
 			t.Fatalf("create testdata: %v", err)
 		}
-		if err := os.WriteFile(goldenPath, append(got, '\n'), 0o644); err != nil {
+		if err := os.WriteFile(goldenPath, got, 0o644); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}
 	}
@@ -233,10 +231,39 @@ func TestEvalWithoutAccountsMatchesGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read golden (run with -update-golden to create it): %v", err)
 	}
-	if string(append(got, '\n')) != string(want) {
+	if string(got) != string(want) {
 		t.Fatalf("single-account Eval output changed; diff %s against:\n%s", goldenPath, got)
 	}
 	if len(transcript.Evaluations) == 0 || transcript.Error == "" {
 		t.Fatalf("the golden scenario must exercise evaluations and the failure path")
 	}
+}
+
+// formatEvalTranscript writes one JSON value per line, so the golden file stays
+// short and a change shows up as the line of the item that changed.
+func formatEvalTranscript(t *testing.T, transcript evalTranscript) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	line := func(prefix string, value interface{}) {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", prefix, err)
+		}
+		out.WriteString(prefix)
+		out.Write(encoded)
+		out.WriteByte('\n')
+	}
+	line("status: ", transcript.Status)
+	line("error: ", transcript.Error)
+	line("create_evidence_calls: ", transcript.CreateEvidenceCalls)
+	for _, execution := range transcript.Executions {
+		line("execution: ", execution)
+	}
+	for _, evaluation := range transcript.Evaluations {
+		line("evaluation: ", evaluation)
+	}
+	for _, uuid := range transcript.EvidenceUUIDs {
+		line("evidence: ", uuid)
+	}
+	return out.Bytes()
 }
