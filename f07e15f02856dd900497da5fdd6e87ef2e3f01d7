@@ -2,3 +2,6 @@ lisa-design:
 - policy_data travels as a new `policyData map[string]interface{}` parameter on the plugin's own PolicyEvaluator.Generate (mirrors the agent's NewPolicyProcessor argument order), rather than a field on DefaultPolicyEvaluator: the evaluator is created once and Configure can run again with different policy_data, so the value lives on CloudCustodianPlugin and is passed per call.
 - Configure always overwrites p.policyData: AsMap() when set, nil when unset, so a reconfigure without policy_data clears an earlier value (same as plugin-github-settings / plugin-file-attestation#7).
 - google.golang.org/protobuf becomes a direct requirement only because the new test builds a structpb.Struct.
+
+lisa-selfreview:
+- pass 1 (packs core,go,go-plugin): approve, no findings. Verified go build/vet/test/-race, gofmt, golangci-lint (shared v1.5.2 config, new-from-merge-base origin/main: 0 issues), goreleaser check (only the existing archives.format deprecation, exit 2) and snapshot build.
