@@ -5,3 +5,6 @@ lisa-design:
 - C7N_SESSION_SUFFIX and CCF_CUSTODIAN_ACCOUNT_ID are only exported when set; the API-trace shim adds account_id to a record only when CCF_CUSTODIAN_ACCOUNT_ID is non-empty, so single-account traces are unchanged.
 - Redaction: both custodian argument logs go through redactCustodianArgs (value after --external-id, and --external-id=...). c7n itself never prints the external ID: with the plugin's single -v, c7n keeps botocore at ERROR (cli.py _setup_logger), and the trace shim logs no API params; so stdout/stderr are not scrubbed (scrubbing a 2-character ID would mangle output).
 - Per-account cache file <TMPDIR>/cloud-custodian-<id>.cache (custodianAccountCachePath); 7b uses it for ambient accounts too (c7n keys its cache by account anyway, a separate file just removes any doubt).
+
+lisa-selfreview:
+7a pass 1: no findings (redaction in both argument logs, no-accounts command line pinned by test, non-AWS checks never get --assume). Approve.
