@@ -307,17 +307,24 @@ type CustodianExecutionRequest struct {
 
 // CustodianExecutionResult captures runtime output and artifacts from one check run.
 type CustodianExecutionResult struct {
-	StartedAt          time.Time
-	EndedAt            time.Time
-	ExitCode           int
-	Stdout             string
-	Stderr             string
-	Error              string
-	Errors             []string
-	Err                error
-	Resources          []interface{}
-	ArtifactPath       string
-	ResourcesPath      string
+	StartedAt     time.Time
+	EndedAt       time.Time
+	ExitCode      int
+	Stdout        string
+	Stderr        string
+	Error         string
+	Errors        []string
+	Err           error
+	Resources     []interface{}
+	ArtifactPath  string
+	ResourcesPath string
+	// ResourcesPaths lists every resources.json read for this run, one per
+	// region when c7n wrote per-region output directories.
+	ResourcesPaths []string
+	// ResourceRegions is index-aligned with Resources and holds the region
+	// taken from c7n's per-region output directory ("" when unknown). It is
+	// nil when c7n wrote the single-region layout.
+	ResourceRegions    []string
 	LogPaths           []string
 	LogTail            string
 	DiagnosticWarnings []string
@@ -660,10 +667,16 @@ commandFinished:
 		"stderr_len", len(result.Stderr),
 	)
 
-	resourcesPath, resources, resourcesErr := readResourcesArtifact(req.OutputDir)
-	result.ResourcesPath = resourcesPath
-	if resources != nil {
-		result.Resources = resources
+	artifact, resourcesErr := readResourcesArtifact(req.OutputDir)
+	result.ResourcesPaths = artifact.Paths
+	if len(artifact.Paths) > 0 {
+		result.ResourcesPath = artifact.Paths[0]
+	}
+	if artifact.Resources != nil {
+		result.Resources = artifact.Resources
+		if !awsGlobalResourceType(req.Check.Resource) {
+			result.ResourceRegions = artifact.Regions
+		}
 	}
 	// Always capture the tail of custodian's own run log, regardless of exit
 	// code or LogTailDuringRun. Custodian frequently exits 0 with an empty
@@ -720,6 +733,7 @@ commandFinished:
 			"check_name", req.Check.Name,
 			"resource_count", len(result.Resources),
 			"resources_path", result.ResourcesPath,
+			"resources_file_count", len(result.ResourcesPaths),
 		)
 	}
 
@@ -1423,30 +1437,120 @@ func tcpStateName(state string) string {
 	}
 }
 
-func readResourcesArtifact(outputDir string) (string, []interface{}, error) {
-	resourcesPath, err := findResourcesJSON(outputDir)
+// resourcesArtifact is the merged content of every resources.json c7n wrote
+// for one run.
+type resourcesArtifact struct {
+	Paths     []string
+	Resources []interface{}
+	// Regions is index-aligned with Resources; nil for the single-region layout.
+	Regions []string
+}
+
+// readResourcesArtifact reads every resources.json under outputDir. With one
+// region c7n writes <out>/<policy>/resources.json; with several regions
+// (including "all") it writes <out>/<region>/<policy>/resources.json, one per
+// region (c7n resources/aws.py initialize_policies). For the per-region layout
+// each resource is tagged with the region of its directory. A resource that
+// c7n returned identically from several regions (e.g. S3 buckets, which
+// list_buckets returns in every region) is kept once, without a region.
+func readResourcesArtifact(outputDir string) (resourcesArtifact, error) {
+	artifact := resourcesArtifact{Resources: []interface{}{}}
+	resourcesPaths, err := findResourcesJSONFiles(outputDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", []interface{}{}, nil
+			return artifact, nil
 		}
-		return "", nil, fmt.Errorf("failed to locate resources.json: %w", err)
+		return resourcesArtifact{}, fmt.Errorf("failed to locate resources.json: %w", err)
 	}
+	artifact.Paths = resourcesPaths
 
+	perRegion := false
+	regions := make([]string, 0)
+	firstSeen := map[string]int{}
+	for _, resourcesPath := range resourcesPaths {
+		region := custodianOutputRegion(outputDir, resourcesPath)
+		if region != "" {
+			perRegion = true
+		}
+		resources, err := readResourcesJSON(resourcesPath)
+		if err != nil {
+			return resourcesArtifact{Paths: resourcesPaths}, err
+		}
+		if len(resourcesPaths) == 1 {
+			artifact.Resources = append(artifact.Resources, resources...)
+			for range resources {
+				regions = append(regions, region)
+			}
+			continue
+		}
+		seenInFile := map[string]bool{}
+		for _, resource := range resources {
+			hash := hashResource(resource)
+			if index, ok := firstSeen[hash]; ok && !seenInFile[hash] && regions[index] != region {
+				// Same resource returned from another region's run: keep the
+				// first copy and drop the region, which c7n didn't scope it to.
+				regions[index] = ""
+				continue
+			}
+			if _, ok := firstSeen[hash]; !ok {
+				firstSeen[hash] = len(artifact.Resources)
+			}
+			seenInFile[hash] = true
+			artifact.Resources = append(artifact.Resources, resource)
+			regions = append(regions, region)
+		}
+	}
+	if perRegion {
+		artifact.Regions = regions
+	}
+	return artifact, nil
+}
+
+func readResourcesJSON(resourcesPath string) ([]interface{}, error) {
 	content, err := os.ReadFile(resourcesPath)
 	if err != nil {
-		return resourcesPath, nil, fmt.Errorf("failed to read resources.json: %w", err)
-	}
-
-	if len(content) == 0 {
-		return resourcesPath, []interface{}{}, nil
+		return nil, fmt.Errorf("failed to read resources.json: %w", err)
 	}
 
 	resources := make([]interface{}, 0)
-	if err := json.Unmarshal(content, &resources); err != nil {
-		return resourcesPath, nil, fmt.Errorf("failed to parse resources.json: %w", err)
+	if len(content) == 0 {
+		return resources, nil
 	}
+	if err := json.Unmarshal(content, &resources); err != nil {
+		return nil, fmt.Errorf("failed to parse resources.json %s: %w", resourcesPath, err)
+	}
+	return resources, nil
+}
 
-	return resourcesPath, resources, nil
+// custodianOutputRegion returns the region directory of a per-region c7n
+// output path (<out>/<region>/<policy>/resources.json), or "" for the
+// single-region layout (<out>/<policy>/resources.json).
+func custodianOutputRegion(outputDir, resourcesPath string) string {
+	rel, err := filepath.Rel(outputDir, resourcesPath)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[0]
+}
+
+// awsGlobalResourceType reports whether every service behind an AWS resource
+// type is global (IAM, CloudFront, Route 53). c7n runs those in one region
+// only, so the region directory says nothing about the resource.
+func awsGlobalResourceType(resource string) bool {
+	services, ok := awsServicesForResource(resource)
+	if !ok || len(services) == 0 {
+		return false
+	}
+	for _, service := range services {
+		if _, global := awsGlobalEndpointServices[service]; !global {
+			return false
+		}
+	}
+	return true
 }
 
 func readCustodianLogArtifacts(outputDir string, maxBytes int) ([]string, string, error) {
@@ -1533,8 +1637,8 @@ func readFileTail(path string, maxBytes int) (string, error) {
 	return string(content), nil
 }
 
-func findResourcesJSON(outputDir string) (string, error) {
-	found := ""
+func findResourcesJSONFiles(outputDir string) ([]string, error) {
+	found := make([]string, 0)
 	err := filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -1543,18 +1647,18 @@ func findResourcesJSON(outputDir string) (string, error) {
 			return nil
 		}
 		if d.Name() == "resources.json" {
-			found = path
-			return filepath.SkipAll
+			found = append(found, path)
 		}
 		return nil
 	})
 
-	if err != nil && !errors.Is(err, filepath.SkipAll) {
-		return "", err
+	if err != nil {
+		return nil, err
 	}
-	if found == "" {
-		return "", fs.ErrNotExist
+	if len(found) == 0 {
+		return nil, fs.ErrNotExist
 	}
+	slices.Sort(found)
 	return found, nil
 }
 
@@ -1897,6 +2001,21 @@ func (p *CloudCustodianPlugin) buildResourceRecord(resourceType string, resource
 		record.Region = region
 	}
 	return record
+}
+
+// buildExecutionRecords builds one record per resource of a run. A region in
+// the resource data wins; otherwise the region of c7n's per-region output
+// directory is used.
+func (p *CloudCustodianPlugin) buildExecutionRecords(resourceType string, execution CustodianExecutionResult) []ResourceRecord {
+	records := make([]ResourceRecord, 0, len(execution.Resources))
+	for i, resource := range execution.Resources {
+		record := p.buildResourceRecord(resourceType, resource)
+		if record.Region == "" && i < len(execution.ResourceRegions) {
+			record.Region = execution.ResourceRegions[i]
+		}
+		records = append(records, record)
+	}
+	return records
 }
 
 func canonicalResourceID(resourceType string, provider string, resourceID string) string {
@@ -2756,10 +2875,7 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 			baselineErr = formatExecutionFailure(check.Name, execution)
 		}
 		p.warnZeroResourceBaseline(check.Name, resourceType, execution)
-		records := make([]ResourceRecord, 0, len(execution.Resources))
-		for _, resource := range execution.Resources {
-			records = append(records, p.buildResourceRecord(resourceType, resource))
-		}
+		records := p.buildExecutionRecords(resourceType, execution)
 		collisionIDs := resourceIDCollisions(records)
 		_, collisionCount := disambiguateResourceRecords(records, collisionIDs)
 		baseline := &InventoryBaseline{
@@ -2776,6 +2892,7 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, ex
 			"raw_resource_count", len(execution.Resources),
 			"id_collision_count", collisionCount,
 			"resources_path", execution.ResourcesPath,
+			"resources_file_count", len(execution.ResourcesPaths),
 			"exit_code", execution.ExitCode,
 			"had_error", baseline.Err != nil,
 			"error", execution.Error,
@@ -2789,10 +2906,7 @@ func (p *CloudCustodianPlugin) buildResourcePayloadsForCheck(
 	execution CustodianExecutionResult,
 	baseline *InventoryBaseline,
 ) []*StandardizedResourcePayload {
-	matchedRecords := make([]ResourceRecord, 0, len(execution.Resources))
-	for _, resource := range execution.Resources {
-		matchedRecords = append(matchedRecords, p.buildResourceRecord(check.Resource, resource))
-	}
+	matchedRecords := p.buildExecutionRecords(check.Resource, execution)
 	collisionIDs := mergeCollisionIDs(
 		resourceIDCollisions(baseline.Records),
 		resourceIDCollisions(matchedRecords),

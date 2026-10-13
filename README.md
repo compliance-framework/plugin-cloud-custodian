@@ -29,6 +29,7 @@ This plugin always enforces read-only Cloud Custodian execution:
 - `--dryrun` is always used.
 - Mutating actions are not applied.
 - For AWS checks, the plugin runs with `--region all` to evaluate across all AWS regions by default unless `aws_regions` is configured.
+- With more than one region (including `all`), Cloud Custodian writes one `resources.json` per region (`<output>/<region>/<policy>/resources.json`). The plugin reads every one of them, for the inventory baseline and for each check.
 - On execution failures or timeouts, the plugin includes the tail of any generated `custodian-run.log` artifacts in the execution error.
 
 ## Configuration
@@ -152,7 +153,12 @@ Each resource/check iteration produces one payload with this shape:
 ```
 
 Generated evidence labels include `resource_id`, `resource_type`, `provider`,
-and any available `account_id`/`region`. The resource subject includes the
+and any available `account_id`/`region`. A region in the resource data is used
+as is; otherwise, when Cloud Custodian wrote per-region output, `region` is the
+region directory the resource came from. Global resource types (IAM, CloudFront,
+Route 53) and resources returned identically by every region (S3 buckets, which
+`ListBuckets` returns everywhere) are kept once and get no region from the
+directory. The resource subject includes the
 resource identifier as a link and a `resource_id` property. When the AWS
 resource identifier is an ARN, generated evidence includes an AWS Resource
 Explorer link using an exact `id:<arn>` search. AWS S3 bucket names are parsed
