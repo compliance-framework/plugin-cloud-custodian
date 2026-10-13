@@ -4,3 +4,8 @@ lisa-design:
 - No synthesized ARNs for types whose records carry none (ebs VolumeId, ec2 InstanceId, s3 Name, hostedzone Id -> existing canonicalResourceID): building ARNs needs partition/account/region and would hard-code arn:aws.
 - Re-key (accepted by the user): app-elb, backup-plan, backup-vault, dynamodb-table, ebs, ecs-service, firewall, lambda, rds, rds-cluster, sns, sqs (were hash) and efs (was the Name tag when tagged, else hash). The other 15 types keep their id.
 - TestAWSIdentityTableCoversEveryKnownResourceType ties the table to awsResourceServices so a new type can't be added without an identity. The README table mirrors the Go table by hand.
+
+lisa-selfreview:
+pass 1 (strict): request_changes
+- [should-fix CORE-DUP-001 c4ec9d95a1b9] README.md Resource Identity table duplicates awsResourceIdentityFields with no sync check; add a test comparing them.
+Checked, no finding: natural-id fallbacks only apply when the ARN field is missing; no synthesized ARNs (PLUGIN-ARN-001); configured fields keep precedence; annotations can't change ids (fields only); every type tested.
