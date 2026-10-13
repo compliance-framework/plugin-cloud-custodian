@@ -1,0 +1,7 @@
+lisa-design:
+- Read every resources.json under the output dir (sorted), not the first one. Region comes from the path only for the c7n per-region layout (<out>/<region>/<policy>/resources.json, exactly 3 segments); single-region layout (2 segments) yields no path region, so single-region evidence labels and UUIDs are unchanged.
+- Region precedence: a region already in the resource data (Region/AwsRegion/c7n:region...) wins; the directory region is only a fallback (buildExecutionRecords).
+- CustodianExecutionResult.ResourceRegions is index-aligned with Resources (nil for single-region) instead of injecting a key into the resource data: injecting would change resource.data seen by OPA and the hash-fallback ids.
+- Resources identical (full-content hash) across region files are kept once with no region: c7n S3 lists every bucket from every region (list_buckets is global), so without this S3 would yield N colliding copies per bucket. Duplicates inside one region file are kept as before (existing collision handling).
+- Global AWS types (all services in awsGlobalEndpointServices: iam, cloudfront, route53) never get a path region: c7n runs them in a single region (first configured or us-east-1), so the dir says nothing and would flip with config order.
+- ResourcesPath stays the first file (unchanged for single-region); ResourcesPaths lists all.
