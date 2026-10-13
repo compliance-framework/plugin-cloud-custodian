@@ -238,7 +238,7 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		debugDumpPayloads = true
 	}
 	if debugDumpPayloads && debugPayloadOutputDir == "" {
-		debugPayloadOutputDir = "debug-standardized-payloads"
+		debugPayloadOutputDir = defaultDebugPayloadOutputDir()
 	}
 
 	return &ParsedConfig{
@@ -374,6 +374,15 @@ func (b *lockedBuffer) Tail(maxBytes int) string {
 // writable emptyDir, so the cache lands somewhere always writable and ephemeral.
 func custodianCachePath() string {
 	return filepath.Join(os.TempDir(), "cloud-custodian.cache")
+}
+
+// defaultDebugPayloadOutputDir is where standardized debug payloads are written
+// when dumping is enabled without an explicit debug_payload_output_dir. The CCF
+// agent may run each plugin with its own working directory, so plugins must not
+// create files relative to their cwd; os.TempDir resolves to $TMPDIR or /tmp,
+// which is always an absolute, writable location in the agent deployment.
+func defaultDebugPayloadOutputDir() string {
+	return filepath.Join(os.TempDir(), "ccf-custodian-debug-payloads")
 }
 
 func custodianDiagnosticInterval(timeout time.Duration) time.Duration {
@@ -2340,11 +2349,20 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 	p.checks = checks
 
 	if parsed.DebugDumpPayloads {
+		if !filepath.IsAbs(parsed.DebugPayloadOutputDir) {
+			p.Logger.Warn("debug_payload_output_dir is relative and resolves against the plugin process working directory; configure an absolute path",
+				"debug_payload_output_dir", parsed.DebugPayloadOutputDir,
+			)
+		}
 		if err := os.MkdirAll(parsed.DebugPayloadOutputDir, 0o755); err != nil {
 			p.Logger.Error("Failed creating debug payload output directory", "debug_payload_output_dir", parsed.DebugPayloadOutputDir, "error", err)
 			return nil, fmt.Errorf("failed creating debug payload output directory %q: %w", parsed.DebugPayloadOutputDir, err)
 		}
-		p.Logger.Debug("Debug payload dumping enabled", "debug_payload_output_dir", parsed.DebugPayloadOutputDir)
+		resolvedDir := parsed.DebugPayloadOutputDir
+		if absDir, err := filepath.Abs(resolvedDir); err == nil {
+			resolvedDir = absDir
+		}
+		p.Logger.Info("Debug payload dumping enabled", "debug_payload_output_dir", resolvedDir)
 	}
 
 	if p.executor == nil {

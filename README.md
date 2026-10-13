@@ -51,7 +51,7 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `policy_labels` | No | JSON map of labels merged into generated evidence labels. |
 | `resource_identity_fields` | No | JSON object mapping Cloud Custodian resource types to ordered identity field paths. Built-in defaults are used after configured fields. Example: `{"aws.ec2":["InstanceId","Arn"]}`. |
 | `debug_dump_payloads` | No | Boolean (`true`/`false`) toggle to write standardized resource payload JSON files for troubleshooting. Default: `false`. |
-| `debug_payload_output_dir` | No | Directory where debug payload JSON files are written. If set, debug dumping is auto-enabled. Default when enabled without explicit path: `debug-standardized-payloads`. |
+| `debug_payload_output_dir` | No | Directory where debug payload JSON files are written. If set, debug dumping is auto-enabled. Default when enabled without explicit path: `ccf-custodian-debug-payloads` under the OS temp directory (`$TMPDIR`, else `/tmp`), e.g. `/tmp/ccf-custodian-debug-payloads`. Use an absolute path: a relative value is still honoured but resolves against the plugin process working directory (which the agent may set per plugin) and logs a warning. The resolved absolute path is logged at `INFO` when dumping is enabled. |
 | `preserve_execution_artifacts` | No | Boolean (`true`/`false`) toggle to keep the temporary Cloud Custodian execution root after a check execution failure for postmortem review. Default: `false`. |
 
 Validation rules:
