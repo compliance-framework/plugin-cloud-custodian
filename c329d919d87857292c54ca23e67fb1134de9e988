@@ -1,0 +1,6 @@
+lisa-design:
+- Built-in per-type identity table (awsResourceIdentityFields) keyed like awsResourceServices (no "aws." prefix; lookup trims it, so "lambda" and "aws.lambda" both match). Fields follow c7n 0.9.49 resource_type arn then id; cache-cluster and transfer-server use the ARN field their describe API returns although c7n declares no arn attribute.
+- Precedence: configured resource_identity_fields > table > generic list > hash. The table is inserted into identityFieldPaths, so buildResourceRecord, identity_fields and collision handling are unchanged.
+- No synthesized ARNs for types whose records carry none (ebs VolumeId, ec2 InstanceId, s3 Name, hostedzone Id -> existing canonicalResourceID): building ARNs needs partition/account/region and would hard-code arn:aws.
+- Re-key (accepted by the user): app-elb, backup-plan, backup-vault, dynamodb-table, ebs, ecs-service, firewall, lambda, rds, rds-cluster, sns, sqs (were hash) and efs (was the Name tag when tagged, else hash). The other 15 types keep their id.
+- TestAWSIdentityTableCoversEveryKnownResourceType ties the table to awsResourceServices so a new type can't be added without an identity. The README table mirrors the Go table by hand.
