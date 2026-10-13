@@ -3,3 +3,6 @@ lisa-design:
 - .goreleaser.yaml `archives.format: tar.gz` -> `formats: [tar.gz]` only: the shared CI runs `goreleaser check`. Snapshot archives compared before/after: same 5 names, same contents (LICENSE, README.md, plugin).
 - release.yml and build-and-upload.yml deliberately untouched (W3 replaces them).
 - 4 pre-existing golangci-lint findings (3 staticcheck, 1 unused) are left for a follow-up; the shared lint only reports new issues.
+
+lisa-selfreview:
+- pass 1 (packs core,go,go-plugin + workflows): approve, no findings. actionlint v1.7.12 clean on all workflows; gofmt, go mod tidy diff, go test, golangci-lint (new from layer 1: 0 issues; config verify ok), goreleaser check (exit 0) and snapshot build all pass.
