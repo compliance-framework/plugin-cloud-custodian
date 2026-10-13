@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -388,11 +389,16 @@ func (p *CloudCustodianPlugin) evalAccounts(ctx context.Context, req *proto.Eval
 		}
 
 		accountRun := newEvalRun()
-		if err := p.evalScope(ctx, req, apiHelper, scope, accountRun); err != nil {
-			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
+		err := p.evalScope(ctx, req, apiHelper, scope, accountRun)
+		if err == nil {
+			err = p.flushEvidence(ctx, apiHelper, accountRun)
 		}
-		if err := p.flushEvidence(ctx, apiHelper, accountRun); err != nil {
-			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
+		if err != nil {
+			// Submission failed: stop, still naming the earlier failed accounts.
+			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, errors.Join(
+				fmt.Errorf("AWS account %s: submitting evidence: %w", account.Label(), err),
+				formatAccountFailures(failures, i),
+			)
 		}
 		run.totalEvidenceCount += accountRun.totalEvidenceCount
 		run.successfulPolicyRuns += accountRun.successfulPolicyRuns
@@ -400,7 +406,7 @@ func (p *CloudCustodianPlugin) evalAccounts(ctx context.Context, req *proto.Eval
 		run.executionDiagnostics = append(run.executionDiagnostics, accountRun.executionDiagnostics...)
 		run.runSummaries = append(run.runSummaries, accountRun.runSummaries...)
 
-		if scope.assumeRoleFailure == nil && !accountRun.hadCheckExecutionFailures {
+		if scope.assumeRoleFailure == nil && scope.accountMismatch == nil && !accountRun.hadCheckExecutionFailures {
 			if accountRun.accumulatedErrors != nil {
 				// Non-fatal policy evaluation errors, as in single-account mode.
 				run.accumulatedErrors = errors.Join(run.accumulatedErrors, fmt.Errorf("AWS account %s: %w", account.Label(), accountRun.accumulatedErrors))
@@ -456,6 +462,62 @@ func isAssumeRoleFailure(execution CustodianExecutionResult) bool {
 	return strings.Contains(execution.Stderr, custodianAssumeRoleFailureMessage) ||
 		strings.Contains(execution.Stdout, custodianAssumeRoleFailureMessage) ||
 		strings.Contains(execution.LogTail, custodianAssumeRoleFailureMessage)
+}
+
+// verifyAmbientAccount checks the use_ambient_credentials entry's id against
+// the accounts in its baseline records' ARNs (records without one are ignored).
+func (p *CloudCustodianPlugin) verifyAmbientAccount(scope *evalScope, baselines map[string]*InventoryBaseline) error {
+	if scope.account == nil || !scope.account.UseAmbientCredentials {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, baseline := range baselines {
+		if baseline == nil {
+			continue
+		}
+		for _, record := range baseline.Records {
+			if account := awsAccountFromARN(record.IdentityFields["arn"]); account != "" {
+				seen[account] = true
+			}
+		}
+	}
+	others := slices.DeleteFunc(slices.Sorted(maps.Keys(seen)), func(account string) bool { return account == scope.account.ID })
+	if len(seen) == 0 {
+		p.Logger.Warn("Cannot verify the use_ambient_credentials account id: no baseline resource has an account in its ARN",
+			"account_id", scope.account.ID,
+			"account_name", scope.account.Name,
+		)
+		return nil
+	}
+	if len(others) > 0 {
+		return fmt.Errorf("use_ambient_credentials entry %s is scanning account %s: set the entry's id to the account of the plugin's own credentials", scope.account.ID, strings.Join(others, ", "))
+	}
+	return nil
+}
+
+// awsAccountFromARN returns the 12-digit account of an ARN
+// (arn:<partition>:<service>:<region>:<account>:...), or "" when it has none.
+func awsAccountFromARN(arn string) string {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) < 6 || parts[0] != "arn" || !awsAccountIDPattern.MatchString(parts[4]) {
+		return ""
+	}
+	return parts[4]
+}
+
+// addAccountNameLabel labels evidence the policy processor already made, so
+// the name doesn't seed the evidence UUID (renaming an account keeps its
+// evidence). A label the policy result sets wins, as for the other labels.
+func addAccountNameLabel(evidences []*proto.Evidence, payload *StandardizedResourcePayload) {
+	for _, evidence := range evidences {
+		if payload.Account == nil || payload.Account.Name == "" || evidence == nil || evidence.Labels["account_name"] != "" {
+			continue
+		}
+		if evidence.Labels == nil {
+			evidence.Labels = map[string]string{}
+		}
+		evidence.Labels["account_name"] = payload.Account.Name
+	}
 }
 
 // setPayloadAccount makes the scanned account the resource's account,

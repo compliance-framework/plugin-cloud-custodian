@@ -2780,7 +2780,10 @@ type evalScope struct {
 	// assumeRoleFailure is the run in which c7n could not assume the
 	// account's role; the scope's remaining runs are skipped.
 	assumeRoleFailure *CustodianExecutionResult
-	skippedRuns       int
+	// accountMismatch is set when the use_ambient_credentials entry's
+	// credentials scan another account; the scope's checks are skipped.
+	accountMismatch error
+	skippedRuns     int
 }
 
 // diagnosticName prefixes an execution name with the scope's account.
@@ -2873,8 +2876,15 @@ func (p *CloudCustodianPlugin) evalScope(ctx context.Context, req *proto.EvalReq
 		run.accumulatedErrors = errors.Join(run.accumulatedErrors, err)
 		run.hadCheckExecutionFailures = true
 	}
-	if scope.assumeRoleFailure != nil {
-		// Without the role no check of this account can run.
+	if scope.assumeRoleFailure == nil {
+		scope.accountMismatch = p.verifyAmbientAccount(scope, baselines)
+	}
+	if scope.accountMismatch != nil {
+		run.accumulatedErrors = errors.Join(run.accumulatedErrors, scope.accountMismatch)
+	}
+	if scope.assumeRoleFailure != nil || scope.accountMismatch != nil {
+		// Without the role, or with another account's credentials, no check
+		// of this account can run.
 		run.hadCheckExecutionFailures = true
 		for _, check := range p.checks {
 			if len(check.ParseErrors) == 0 {
@@ -3283,9 +3293,6 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 	if payload.Resource.AccountID != "" {
 		labels["account_id"] = payload.Resource.AccountID
 	}
-	if payload.Account != nil && payload.Account.Name != "" {
-		labels["account_name"] = payload.Account.Name
-	}
 	if payload.Resource.Region != "" {
 		labels["region"] = payload.Resource.Region
 	}
@@ -3417,6 +3424,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 			payload,
 		)
 		addResourceExplorerLinkToEvidence(evidences, payload, p.Logger)
+		addAccountNameLabel(evidences, payload)
 		allEvidences = append(allEvidences, evidences...)
 		if err != nil {
 			p.Logger.Warn("Policy path evaluation failed for resource",

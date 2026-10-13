@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -99,7 +100,7 @@ func (r *recordingEvaluator) Generate(
 	for key, value := range labels {
 		seed[key] = value
 	}
-	return []*proto.Evidence{{UUID: stableHashValue(seed), Labels: recorded.Labels}}, nil
+	return []*proto.Evidence{{UUID: stableHashValue(seed), Labels: maps.Clone(recorded.Labels)}}, nil
 }
 
 type recordedExecution struct {
@@ -119,6 +120,7 @@ type evalTranscript struct {
 	Executions          []recordedExecution  `json:"executions"`
 	Evaluations         []recordedEvaluation `json:"evaluations"`
 	EvidenceUUIDs       []string             `json:"evidence_uuids"`
+	EvidenceLabels      []map[string]string  `json:"-"`
 	CreateEvidenceCalls int                  `json:"create_evidence_calls"`
 }
 
@@ -157,6 +159,7 @@ func runEvalTranscript(t *testing.T, plugin *CloudCustodianPlugin, executor *acc
 	}
 	for _, evidence := range apiHelper.evidence {
 		transcript.EvidenceUUIDs = append(transcript.EvidenceUUIDs, evidence.GetUUID())
+		transcript.EvidenceLabels = append(transcript.EvidenceLabels, evidence.GetLabels())
 	}
 	return transcript
 }
@@ -375,12 +378,12 @@ func TestEvalAccountsLabelsPayloadAndSubject(t *testing.T) {
 		if evaluation.Labels["account_id"] != account.ID {
 			t.Fatalf("expected account_id %s, got %q", account.ID, evaluation.Labels["account_id"])
 		}
-		name, hasName := evaluation.Labels["account_name"]
-		if account.Name != "" && name != account.Name {
-			t.Fatalf("expected account_name %q, got %q", account.Name, name)
+		if name, seeded := evaluation.Labels["account_name"]; seeded {
+			t.Fatalf("account_name must not seed the evidence UUID, got %q", name)
 		}
-		if account.Name == "" && hasName {
-			t.Fatalf("an account without a name must not get the policy_labels account_name, got %q", name)
+		// Added after the UUID; an account without a name gets none (not the policy_labels one).
+		if name := transcript.EvidenceLabels[i]["account_name"]; name != account.Name {
+			t.Fatalf("expected the evidence label account_name %q, got %q", account.Name, name)
 		}
 		if evaluation.Labels["team"] != "platform" {
 			t.Fatalf("other policy_labels must be kept, got %v", evaluation.Labels)
@@ -409,7 +412,7 @@ func TestEvalAccountsLabelsPayloadAndSubject(t *testing.T) {
 	}
 }
 
-func TestEvalAccountsEvidenceUUIDsDifferPerAccount(t *testing.T) {
+func TestEvalAccountsEvidenceUUIDsDifferPerAccountNotPerName(t *testing.T) {
 	policyDir := t.TempDir()
 	policy := `package compliance_framework.accounts_test
 
@@ -422,27 +425,109 @@ violation := []
 	if err := os.WriteFile(filepath.Join(policyDir, "policy.rego"), []byte(policy), 0o600); err != nil {
 		t.Fatalf("write policy: %v", err)
 	}
-	plugin := accountsPlugin([]AWSAccount{prodAccount, devAccount}, []string{"us-east-1"}, twoTypeChecks()[:1])
-	plugin.Logger = hclog.NewNullLogger()
-	plugin.executor = &accountFakeExecutor{results: map[string]CustodianExecutionResult{
-		"inventory-aws-s3": fixedExecution(map[string]interface{}{"Name": "same-bucket"}),
-	}}
-	plugin.evaluator = &DefaultPolicyEvaluator{Logger: hclog.NewNullLogger()}
-	apiHelper := &fakeAPIHelper{}
-
-	resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{policyDir}}, apiHelper)
-	if err != nil || resp.GetStatus() != proto.ExecutionStatus_SUCCESS {
-		t.Fatalf("expected success, got %s: %v", resp.GetStatus(), err)
+	evidence := func(prodName, devName string) []*proto.Evidence {
+		prod, dev := prodAccount, devAccount
+		prod.Name, dev.Name = prodName, devName
+		plugin := accountsPlugin([]AWSAccount{prod, dev}, []string{"us-east-1"}, twoTypeChecks()[:1])
+		plugin.Logger = hclog.NewNullLogger()
+		plugin.executor = &accountFakeExecutor{results: map[string]CustodianExecutionResult{
+			"inventory-aws-s3": fixedExecution(map[string]interface{}{"Name": "same-bucket"}),
+		}}
+		plugin.evaluator = &DefaultPolicyEvaluator{Logger: hclog.NewNullLogger()}
+		apiHelper := &fakeAPIHelper{}
+		resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{policyDir}}, apiHelper)
+		if err != nil || resp.GetStatus() != proto.ExecutionStatus_SUCCESS {
+			t.Fatalf("expected success, got %s: %v", resp.GetStatus(), err)
+		}
+		if len(apiHelper.evidence) != 2 {
+			t.Fatalf("expected one evidence per account, got %d", len(apiHelper.evidence))
+		}
+		return apiHelper.evidence
 	}
-	if len(apiHelper.evidence) != 2 {
-		t.Fatalf("expected one evidence per account, got %d", len(apiHelper.evidence))
-	}
-	first, second := apiHelper.evidence[0], apiHelper.evidence[1]
+	named := evidence(prodAccount.Name, devAccount.Name)
+	first, second := named[0], named[1]
 	if first.GetUUID() == "" || first.GetUUID() == second.GetUUID() {
 		t.Fatalf("expected distinct evidence UUIDs, got %q and %q", first.GetUUID(), second.GetUUID())
 	}
 	if first.GetLabels()["resource_id"] != second.GetLabels()["resource_id"] {
 		t.Fatalf("the test needs the same resource id in both accounts")
+	}
+	// Renaming accounts (prod renamed, dev given a name) keeps their evidence streams.
+	renamed := evidence("production", "dev")
+	for i := range named {
+		if named[i].GetUUID() != renamed[i].GetUUID() {
+			t.Fatalf("renaming an account changed its evidence UUID from %q to %q", named[i].GetUUID(), renamed[i].GetUUID())
+		}
+	}
+	if renamed[0].GetLabels()["account_name"] != "production" {
+		t.Fatalf("expected the evidence label account_name production, got %v", renamed[0].GetLabels())
+	}
+}
+
+func TestEvalAccountsVerifiesTheAmbientAccount(t *testing.T) {
+	lambda := func(arns ...string) CustodianExecutionResult {
+		resources := []interface{}{map[string]interface{}{"FunctionName": "no-arn"}}
+		for _, arn := range arns {
+			resources = append(resources, map[string]interface{}{"FunctionArn": arn})
+		}
+		return fixedExecution(resources...)
+	}
+	checks := []CustodianCheck{{Name: "lambda-check", Resource: "aws.lambda", Provider: "aws", RawPolicy: map[string]interface{}{"name": "lambda-check", "resource": "aws.lambda"}}}
+	for _, tc := range []struct {
+		name, wantErr, wantLog string
+		hub                    CustodianExecutionResult
+	}{
+		{"mismatch fails the account", "use_ambient_credentials entry 111111111111 is scanning account 222222222222", "", lambda("arn:aws:lambda:eu-west-1:222222222222:function:f")},
+		{"match", "", "", lambda("arn:aws:lambda:eu-west-1:111111111111:function:f", "arn:aws:s3:::no-account")},
+		{"no account in any ARN warns", "", "Cannot verify the use_ambient_credentials account id", lambda()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			plugin := accountsPlugin([]AWSAccount{hubAccount, devAccount}, nil, checks)
+			plugin.Logger = hclog.New(&hclog.LoggerOptions{Output: &logs, Level: hclog.Warn})
+			transcript := runEvalTranscript(t, plugin, &accountFakeExecutor{results: map[string]CustodianExecutionResult{
+				"111111111111/inventory-aws-lambda": tc.hub,
+				"inventory-aws-lambda":              lambda("arn:aws:lambda:us-east-1:333333333333:function:dev"),
+			}}, []string{"bundle"})
+			hubEvaluations := 0
+			for _, evaluation := range transcript.Evaluations {
+				if evaluation.Labels["account_id"] == hubAccount.ID {
+					hubEvaluations++
+				}
+			}
+			wantFirst := "cloud custodian failed in 1 of 2 AWS account(s): 111111111111 (hub); evidence from the other 1 account(s) was submitted\n"
+			if tc.wantErr != "" && (transcript.Status != "FAILURE" || !strings.HasPrefix(transcript.Error, wantFirst) || !strings.Contains(transcript.Error, tc.wantErr) || hubEvaluations != 0 || len(transcript.EvidenceUUIDs) != 2) {
+				t.Fatalf("expected only the hub to fail, with no hub evidence: %s, %d hub evaluation(s), %d evidence\n%s", transcript.Status, hubEvaluations, len(transcript.EvidenceUUIDs), transcript.Error)
+			}
+			if tc.wantErr == "" && (transcript.Status != "SUCCESS" || hubEvaluations == 0) {
+				t.Fatalf("expected success with hub evidence, got %s with %d hub evaluation(s): %s", transcript.Status, hubEvaluations, transcript.Error)
+			}
+			if !strings.Contains(logs.String(), tc.wantLog) {
+				t.Fatalf("expected the log to contain %q:\n%s", tc.wantLog, logs.String())
+			}
+		})
+	}
+}
+
+func TestEvalAccountsSubmissionErrorNamesEarlierFailures(t *testing.T) {
+	plugin := accountsPlugin([]AWSAccount{prodAccount, devAccount}, []string{"us-east-1"}, twoTypeChecks()[:1])
+	plugin.Logger = hclog.NewNullLogger()
+	plugin.executor = &accountFakeExecutor{results: map[string]CustodianExecutionResult{
+		"222222222222/inventory-aws-s3": assumeRoleFailureResult(prodAccount.RoleARN),
+		"inventory-aws-s3":              fixedExecution(map[string]interface{}{"Name": "bucket"}),
+	}}
+	plugin.evaluator = &recordingEvaluator{}
+	apiErr := errors.New("api unavailable")
+	apiHelper := &fakeAPIHelper{err: apiErr}
+	resp, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle"}}, apiHelper)
+	// prod fails first without evidence; dev's submission is the only CreateEvidence call.
+	if resp.GetStatus() != proto.ExecutionStatus_FAILURE || apiHelper.calls != 1 || !errors.Is(err, apiErr) {
+		t.Fatalf("expected the submission error, got %s after %d call(s): %v", resp.GetStatus(), apiHelper.calls, err)
+	}
+	for _, want := range []string{"AWS account 333333333333: submitting evidence: api unavailable", "cloud custodian failed in 1 of 1 AWS account(s): 222222222222 (prod) [could not assume role]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected the error to contain %q:\n%s", want, err)
+		}
 	}
 }
 
