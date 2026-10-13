@@ -1,0 +1,5 @@
+lisa-design:
+- ci.yml is mock-plugin-1's caller copied as is (header comment dropped), with all three `uses:` pinned to compliance-framework/workflows v1.5.2 (6e7fc9c0...). push trigger stays on main (the repo's default branch).
+- .goreleaser.yaml `archives.format: tar.gz` -> `formats: [tar.gz]` only: the shared CI runs `goreleaser check`. Snapshot archives compared before/after: same 5 names, same contents (LICENSE, README.md, plugin).
+- release.yml and build-and-upload.yml deliberately untouched (W3 replaces them).
+- 4 pre-existing golangci-lint findings (3 staticcheck, 1 unused) are left for a follow-up; the shared lint only reports new issues.
