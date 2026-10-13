@@ -1,0 +1,2 @@
+lisa-addressed:
+- CORE-TEST-002 61bbcd0a0c65: TestEvalEvaluatesResourcesFromEveryRegion now reads the status from the index-aligned evaluator call and fails when calls and label sets differ in length.
