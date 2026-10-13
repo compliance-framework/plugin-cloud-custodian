@@ -1,0 +1,3 @@
+lisa-design:
+- Only the Init subject templates' Type changes (RESOURCE -> COMPONENT), per the user's decision (2026-10-13). Evidence subjects built in Eval keep SUBJECT_TYPE_RESOURCE; names, identity label keys, selectors and label schema are unchanged.
+- The API's SubjectTemplateService resolves system components only from templates of type component (ResolveOrUpsertSystemComponent rejects other types), matching on selector and identity labels.
