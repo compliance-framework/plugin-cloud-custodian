@@ -2439,8 +2439,8 @@ func (p *CloudCustodianPlugin) buildSubjectTemplates(resourceTypes []string) []*
 		provider := extractProvider(resourceType)
 		templates = append(templates, &proto.SubjectTemplate{
 			Name: fmt.Sprintf("cloud-custodian-%s", sanitizeIdentifier(resourceType)),
-			// These templates represent cloud resources collected during evaluation.
-			Type:                proto.SubjectType_SUBJECT_TYPE_RESOURCE,
+			// Component type: the API resolves system components only from component templates.
+			Type:                proto.SubjectType_SUBJECT_TYPE_COMPONENT,
 			TitleTemplate:       "Cloud Resource: {{ .resource_type }} {{ .resource_id }}",
 			DescriptionTemplate: "Cloud Custodian resource {{ .resource_id }} of type {{ .resource_type }} from provider {{ .provider }}",
 			PurposeTemplate:     "Represents a cloud resource collected by Cloud Custodian for compliance evaluation.",

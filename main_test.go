@@ -2976,8 +2976,10 @@ risk_templates := [{
 	if len(apiHelper.subjectTemplates) != 2 {
 		t.Fatalf("expected two unique subject templates, got %d", len(apiHelper.subjectTemplates))
 	}
-	if apiHelper.subjectTemplates[0].GetType() != proto.SubjectType_SUBJECT_TYPE_RESOURCE {
-		t.Fatalf("expected resource subject template type")
+	for _, subjectTemplate := range apiHelper.subjectTemplates {
+		if subjectTemplate.GetType() != proto.SubjectType_SUBJECT_TYPE_COMPONENT {
+			t.Fatalf("expected component subject template type for %s, got %s", subjectTemplate.GetName(), subjectTemplate.GetType())
+		}
 	}
 	if got := apiHelper.subjectTemplates[0].GetIdentityLabelKeys(); len(got) != 3 || got[2] != "resource_id" {
 		t.Fatalf("expected resource_id identity label, got %v", got)
