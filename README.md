@@ -109,7 +109,9 @@ plugins:
 Without `aws_accounts` the plugin scans the account of its own (ambient) credentials, exactly as before. With
 `aws_accounts`, it scans only the listed accounts, one after the other, assuming a role in each through Cloud
 Custodian's `--assume` and `--external-id`. The account the plugin runs in (the hub) is scanned only when it is
-listed with `use_ambient_credentials: true`.
+listed with `use_ambient_credentials: true`. Its `id` is checked against the accounts in the ARNs of the resources it
+finds: if they name another account, the hub fails and submits no evidence (the other accounts still run); if no ARN
+names an account, the plugin logs a warning that it can't verify the id.
 
 For each account:
 
@@ -150,7 +152,8 @@ What changes in accounts mode:
 - `account_id` is part of the evidence UUID seed and of the resource subject id
   (`cloud-custodian-resource/<account>/<type>/<id>`), and the subject templates' identity keys are
   `provider`, `account_id`, `resource_type`, `resource_id`. The same resource id in two accounts is two resources.
-  Moving an existing deployment to `aws_accounts` therefore re-keys its evidence streams once.
+  Moving an existing deployment to `aws_accounts` therefore re-keys its evidence streams once. `account_name` is
+  not part of the seed, so renaming an account keeps its evidence streams.
 - Each account has its own inventory baseline, Cloud Custodian cache file and output directory.
 
 When an account fails (for example its role can't be assumed, which skips the account's remaining runs), the other
