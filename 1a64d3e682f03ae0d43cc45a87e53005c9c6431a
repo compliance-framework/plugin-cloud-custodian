@@ -5,3 +5,8 @@ lisa-design:
 - Resources identical (full-content hash) across region files are kept once with no region: c7n S3 lists every bucket from every region (list_buckets is global), so without this S3 would yield N colliding copies per bucket. Duplicates inside one region file are kept as before (existing collision handling).
 - Global AWS types (all services in awsGlobalEndpointServices: iam, cloudfront, route53) never get a path region: c7n runs them in a single region (first configured or us-east-1), so the dir says nothing and would flip with config order.
 - ResourcesPath stays the first file (unchanged for single-region); ResourcesPaths lists all.
+
+lisa-selfreview:
+pass 1 (strict): request_changes
+- [must-fix CORE-TEST-002 61bbcd0a0c65] regions_test.go TestEvalEvaluatesResourcesFromEveryRegion: status looked up by prefix search over evaluator.calls with a 'compliant' default; use index-aligned calls[i].
+Checked, no finding: cross-region dedupe key (full-content hash; regional resources carry region-specific ARNs/ids, deliberate per design note), per-region read error fails the run (not skipped), single-region layout unchanged, README updated.
