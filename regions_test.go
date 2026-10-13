@@ -288,19 +288,15 @@ func TestEvalEvaluatesResourcesFromEveryRegion(t *testing.T) {
 				t.Fatalf("expected success, got %s", resp.GetStatus())
 			}
 
+			if len(evaluator.calls) != len(evaluator.labelsSeen) {
+				t.Fatalf("evaluator recorded %d calls but %d label sets", len(evaluator.calls), len(evaluator.labelsSeen))
+			}
 			got := make([]string, 0, len(evaluator.labelsSeen))
-			for _, labels := range evaluator.labelsSeen {
-				region, hasRegion := labels["region"]
-				if !hasRegion {
-					region = ""
-				}
-				status := "compliant"
-				for _, call := range evaluator.calls {
-					if strings.HasPrefix(call, labels["check_name"]+"|"+labels["resource_id"]+"|") {
-						status = call[strings.LastIndex(call, "|")+1:]
-					}
-				}
-				got = append(got, strings.Join([]string{labels["check_name"], labels["resource_id"], status, region}, "|"))
+			for i, labels := range evaluator.labelsSeen {
+				// calls[i] is "check|resource_id|policy_path|status".
+				call := evaluator.calls[i]
+				status := call[strings.LastIndex(call, "|")+1:]
+				got = append(got, strings.Join([]string{labels["check_name"], labels["resource_id"], status, labels["region"]}, "|"))
 			}
 			slices.Sort(got)
 			if !slices.Equal(got, tt.want) {
