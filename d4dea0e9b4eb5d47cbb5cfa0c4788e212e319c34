@@ -6,3 +6,6 @@ lisa-design:
 - Beyond the spec, on purpose: at most one ambient entry (ambient credentials are one account, a second entry would re-scan it under another id); external IDs must also match STS's character set [\w+=,.@:/-] and an unresolved ${env:...} literal (agent R60 passes unset placeholders through) is rejected with a hint; aws_session_name_suffix must fit STS RoleSessionName ("CloudCustodian@" + suffix <= 64, [\w+=,.@-]).
 - Partition for role_name ARNs: aws_partition, else derived from the entry's effective regions (entry regions > aws_regions; cn- -> aws-cn, us-gov- -> aws-us-gov; none/all -> aws). Regions spanning partitions only fail when the partition must be derived; role_arn keeps whatever partition it names.
 - Errors and logs never contain an external ID value: errors give its length or the rule, the Configure log shows has_external_id only.
+
+lisa-selfreview:
+pass 1: role_arn regex accepted any text after role/ (e.g. spaces) -> fix (CORE-INPUT-001, should-fix). README docs for the new keys deliberately land in layer 8 (ra/w2-c7n-accounts-docs) of this stack (PLUGIN-CFG-001 deferred by stack design); accounts are parsed but not applied until layer 7 (spec: "no behaviour change yet").
