@@ -1804,9 +1804,17 @@ type StandardizedResourcePayload struct {
 	Source        string                   `json:"source"`
 	Check         StandardizedCheckInfo    `json:"check"`
 	Resource      StandardizedResourceInfo `json:"resource"`
-	Assessment    StandardizedAssessment   `json:"assessment"`
-	Execution     StandardizedExecution    `json:"execution"`
-	RawPolicy     map[string]interface{}   `json:"raw_policy"`
+	// Account is the scanned AWS account; set in accounts mode only.
+	Account    *StandardizedAccountInfo `json:"account,omitempty"`
+	Assessment StandardizedAssessment   `json:"assessment"`
+	Execution  StandardizedExecution    `json:"execution"`
+	RawPolicy  map[string]interface{}   `json:"raw_policy"`
+}
+
+// StandardizedAccountInfo names the AWS account a resource was scanned in.
+type StandardizedAccountInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type StandardizedResourceInfo struct {
@@ -2586,6 +2594,13 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 		p.Logger.Error("Error parsing cloud custodian policies", "error", err)
 		return nil, err
 	}
+	if err := validateAccountsModeChecks(parsed, checks); err != nil {
+		p.Logger.Error("Error validating cloud custodian policies for aws_accounts", "error", err)
+		return nil, err
+	}
+	if ignored := ignoredAccountPolicyLabels(parsed); len(ignored) > 0 {
+		p.Logger.Warn("policy_labels keys are reserved in accounts mode and ignored; each account's id and name are used", "keys", ignored)
+	}
 	parseErrorChecks := 0
 	for _, check := range checks {
 		if len(check.ParseErrors) > 0 {
@@ -2680,7 +2695,23 @@ func (p *CloudCustodianPlugin) Init(req *proto.InitRequest, apiHelper runner.Api
 
 func (p *CloudCustodianPlugin) buildSubjectTemplates(resourceTypes []string) []*proto.SubjectTemplate {
 	templates := make([]*proto.SubjectTemplate, 0, len(resourceTypes))
+	identityLabelKeys := []string{"provider", "resource_type", "resource_id"}
+	if p.accountsMode() {
+		// The same resource id can exist in several accounts.
+		identityLabelKeys = []string{"provider", "account_id", "resource_type", "resource_id"}
+	}
 	for _, resourceType := range resourceTypes {
+		labelSchema := []*proto.SubjectLabelSchema{
+			{Key: "provider", Description: "Cloud provider derived from the Cloud Custodian resource type."},
+			{Key: "resource_type", Description: "Cloud Custodian resource type such as aws.ec2 or aws.s3."},
+			{Key: "resource_id", Description: "Stable resource identifier extracted from the resource data."},
+			{Key: "account_id", Description: "Cloud account identifier when available in the resource data."},
+			{Key: "region", Description: "Cloud region when available in the resource data."},
+		}
+		if p.accountsMode() {
+			labelSchema[3].Description = "AWS account the resource was scanned in, from aws_accounts."
+			labelSchema = append(labelSchema, &proto.SubjectLabelSchema{Key: "account_name", Description: "Name of the AWS account in aws_accounts, when set."})
+		}
 		provider := extractProvider(resourceType)
 		templates = append(templates, &proto.SubjectTemplate{
 			Name: fmt.Sprintf("cloud-custodian-%s", sanitizeIdentifier(resourceType)),
@@ -2689,7 +2720,7 @@ func (p *CloudCustodianPlugin) buildSubjectTemplates(resourceTypes []string) []*
 			TitleTemplate:       "Cloud Resource: {{ .resource_type }} {{ .resource_id }}",
 			DescriptionTemplate: "Cloud Custodian resource {{ .resource_id }} of type {{ .resource_type }} from provider {{ .provider }}",
 			PurposeTemplate:     "Represents a cloud resource collected by Cloud Custodian for compliance evaluation.",
-			IdentityLabelKeys:   []string{"provider", "resource_type", "resource_id"},
+			IdentityLabelKeys:   identityLabelKeys,
 			Props: []*proto.SubjectProp{
 				{Name: "provider", Value: provider},
 				{Name: "resource_type", Value: resourceType},
@@ -2698,13 +2729,7 @@ func (p *CloudCustodianPlugin) buildSubjectTemplates(resourceTypes []string) []*
 				{Key: "source", Value: sourceCloudCustodian},
 				{Key: "resource_type", Value: resourceType},
 			},
-			LabelSchema: []*proto.SubjectLabelSchema{
-				{Key: "provider", Description: "Cloud provider derived from the Cloud Custodian resource type."},
-				{Key: "resource_type", Description: "Cloud Custodian resource type such as aws.ec2 or aws.s3."},
-				{Key: "resource_id", Description: "Stable resource identifier extracted from the resource data."},
-				{Key: "account_id", Description: "Cloud account identifier when available in the resource data."},
-				{Key: "region", Description: "Cloud region when available in the resource data."},
-			},
+			LabelSchema: labelSchema,
 		})
 	}
 	return templates
@@ -2743,13 +2768,37 @@ func newEvalRun() *evalRun {
 	return &evalRun{pendingEvidences: make([]*proto.Evidence, 0, evidenceBatchSize)}
 }
 
-// evalScope is one pass over every check with its own output root and
-// regions.
+// evalScope is one pass over every check: the whole run outside accounts
+// mode, or one AWS account in accounts mode.
 type evalScope struct {
+	// account is nil outside accounts mode.
+	account *AWSAccount
 	// root holds the scope's custodian output directories.
 	root string
 	// regions are passed to every custodian run of the scope.
 	regions []string
+	// assumeRoleFailure is the run in which c7n could not assume the
+	// account's role; the scope's remaining runs are skipped.
+	assumeRoleFailure *CustodianExecutionResult
+	// accountMismatch is set when the use_ambient_credentials entry's
+	// credentials scan another account; the scope's checks are skipped.
+	accountMismatch error
+	skippedRuns     int
+}
+
+// diagnosticName prefixes an execution name with the scope's account.
+func (s *evalScope) diagnosticName(name string) string {
+	if s.account == nil {
+		return name
+	}
+	return s.account.ID + "/" + name
+}
+
+func (s *evalScope) accountID() string {
+	if s.account == nil {
+		return ""
+	}
+	return s.account.ID
 }
 
 func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.ApiHelper) (*proto.EvalResponse, error) {
@@ -2786,6 +2835,10 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	}()
 	p.Logger.Debug("Created temporary execution root", "execution_root", executionRoot)
 
+	if p.accountsMode() {
+		return p.evalAccounts(ctx, req, apiHelper, executionRoot, run)
+	}
+
 	scope := &evalScope{root: executionRoot, regions: p.parsedConfig.AWSRegions}
 	if err := p.evalScope(ctx, req, apiHelper, scope, run); err != nil {
 		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
@@ -2797,7 +2850,7 @@ func (p *CloudCustodianPlugin) Eval(req *proto.EvalRequest, apiHelper runner.Api
 	} else {
 		p.Logger.Warn("No evidence generated by current evaluation run")
 	}
-	return p.evalOutcome(run)
+	return p.evalOutcome(run, nil)
 }
 
 // evalScope runs the inventory baselines and every check of one scope and
@@ -2814,7 +2867,7 @@ func (p *CloudCustodianPlugin) evalScope(ctx context.Context, req *proto.EvalReq
 		// A baseline with only diagnostic warnings (e.g. unreachable endpoints)
 		// is still treated as a failure below, so reflect that in had_error.
 		baselineHadWarnings := len(baseline.Execution.DiagnosticWarnings) > 0
-		run.executionDiagnostics = append(run.executionDiagnostics, newExecutionDiagnostic(baselineName, resourceType, true, baseline.Execution, baseline.Err != nil || baselineHadWarnings))
+		run.executionDiagnostics = append(run.executionDiagnostics, newExecutionDiagnostic(scope.diagnosticName(baselineName), resourceType, true, baseline.Execution, baseline.Err != nil || baselineHadWarnings))
 		if baseline.Err != nil || !baselineHadWarnings {
 			continue
 		}
@@ -2823,10 +2876,35 @@ func (p *CloudCustodianPlugin) evalScope(ctx context.Context, req *proto.EvalReq
 		run.accumulatedErrors = errors.Join(run.accumulatedErrors, err)
 		run.hadCheckExecutionFailures = true
 	}
+	if scope.assumeRoleFailure == nil {
+		scope.accountMismatch = p.verifyAmbientAccount(scope, baselines)
+	}
+	if scope.accountMismatch != nil {
+		run.accumulatedErrors = errors.Join(run.accumulatedErrors, scope.accountMismatch)
+	}
+	if scope.assumeRoleFailure != nil || scope.accountMismatch != nil {
+		// Without the role, or with another account's credentials, no check
+		// of this account can run.
+		run.hadCheckExecutionFailures = true
+		for _, check := range p.checks {
+			if len(check.ParseErrors) == 0 {
+				scope.skippedRuns++
+			}
+		}
+		return nil
+	}
 	for _, check := range p.checks {
 		p.Logger.Debug("Processing check", "check_name", check.Name, "check_index", check.Index, "resource", check.Resource, "provider", check.Provider)
 		if len(check.ParseErrors) > 0 {
+			if scope.account != nil {
+				// Reported once for every account by evalAccounts.
+				continue
+			}
 			p.recordCheckParseErrors(run, check)
+			continue
+		}
+		if scope.assumeRoleFailure != nil {
+			scope.skippedRuns++
 			continue
 		}
 
@@ -2845,23 +2923,29 @@ func (p *CloudCustodianPlugin) evalScope(ctx context.Context, req *proto.EvalReq
 			if baseline != nil {
 				baselineRecordCount = len(baseline.Records)
 			}
-			run.runSummaries = append(run.runSummaries, checkRunSummary{Check: check.Name, Resource: check.Resource, ExitCode: -1, BaselineResourceCount: baselineRecordCount, HadError: true, Regions: scope.regions})
+			run.runSummaries = append(run.runSummaries, checkRunSummary{Account: scope.accountID(), Check: check.Name, Resource: check.Resource, ExitCode: -1, BaselineResourceCount: baselineRecordCount, HadError: true, Regions: scope.regions})
 			continue
 		}
 
 		checkDir := filepath.Join(scope.root, fmt.Sprintf("%03d-%s", check.Index+1, sanitizeIdentifier(check.Name)))
 		execution := p.executor.Execute(ctx, p.executionRequest(scope, check, checkDir))
+		p.detectAssumeRoleFailure(scope, execution)
 		if execution.Err != nil || execution.Error != "" {
 			err := formatExecutionFailure(check.Name, execution)
 			p.Logger.Error("Skipping resource evaluation due to check execution error", "check_name", check.Name, "error", err)
 			run.accumulatedErrors = errors.Join(run.accumulatedErrors, err)
 			run.hadCheckExecutionFailures = true
-			run.executionDiagnostics = append(run.executionDiagnostics, newExecutionDiagnostic(check.Name, check.Resource, false, execution, true))
-			run.runSummaries = append(run.runSummaries, checkRunSummary{Check: check.Name, Resource: check.Resource, ExitCode: execution.ExitCode, BaselineResourceCount: len(baseline.Records), MatchedResourceCount: len(execution.Resources), HadError: true, Regions: scope.regions})
+			run.executionDiagnostics = append(run.executionDiagnostics, newExecutionDiagnostic(scope.diagnosticName(check.Name), check.Resource, false, execution, true))
+			run.runSummaries = append(run.runSummaries, checkRunSummary{Account: scope.accountID(), Check: check.Name, Resource: check.Resource, ExitCode: execution.ExitCode, BaselineResourceCount: len(baseline.Records), MatchedResourceCount: len(execution.Resources), HadError: true, Regions: scope.regions})
 			continue
 		}
 
 		payloads := p.buildResourcePayloadsForCheck(check, execution, baseline)
+		if scope.account != nil {
+			for _, payload := range payloads {
+				setPayloadAccount(payload, *scope.account)
+			}
+		}
 		payloadStats := summarizePayloadAssessments(payloads)
 		p.Logger.Debug("Built standardized resource payloads",
 			"check_name", check.Name,
@@ -2922,8 +3006,9 @@ func (p *CloudCustodianPlugin) evalScope(ctx context.Context, req *proto.EvalReq
 			run.hadCheckExecutionFailures = true
 			checkHadError = true
 		}
-		run.executionDiagnostics = append(run.executionDiagnostics, newExecutionDiagnostic(check.Name, check.Resource, false, execution, checkHadError))
+		run.executionDiagnostics = append(run.executionDiagnostics, newExecutionDiagnostic(scope.diagnosticName(check.Name), check.Resource, false, execution, checkHadError))
 		run.runSummaries = append(run.runSummaries, checkRunSummary{
+			Account:               scope.accountID(),
 			Check:                 check.Name,
 			Resource:              check.Resource,
 			ExitCode:              execution.ExitCode,
@@ -2965,8 +3050,9 @@ func (p *CloudCustodianPlugin) flushEvidence(ctx context.Context, apiHelper runn
 	return nil
 }
 
-// evalOutcome turns a finished run into Eval's response.
-func (p *CloudCustodianPlugin) evalOutcome(run *evalRun) (*proto.EvalResponse, error) {
+// evalOutcome turns a finished run into Eval's response. accountsErr is the
+// aggregated error of the accounts that failed (accounts mode only).
+func (p *CloudCustodianPlugin) evalOutcome(run *evalRun, accountsErr error) (*proto.EvalResponse, error) {
 	// Consolidated, one-glance picture across every resource type. Emitted at
 	// Warn when no evidence was produced, otherwise at Debug since a run that
 	// produced evidence is the healthy case.
@@ -2984,6 +3070,9 @@ func (p *CloudCustodianPlugin) evalOutcome(run *evalRun) (*proto.EvalResponse, e
 		"per_check", run.runSummaries,
 	)
 
+	if accountsErr != nil {
+		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, errors.Join(accountsErr, run.accumulatedErrors)
+	}
 	if zeroEvidenceOutcome {
 		return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, composeZeroEvidenceError(run.accumulatedErrors, run.executionDiagnostics)
 	}
@@ -3012,7 +3101,7 @@ func (p *CloudCustodianPlugin) submitEvidenceBatch(ctx context.Context, apiHelpe
 
 // executionRequest builds the custodian request of one run in a scope.
 func (p *CloudCustodianPlugin) executionRequest(scope *evalScope, check CustodianCheck, outputDir string) CustodianExecutionRequest {
-	return CustodianExecutionRequest{
+	req := CustodianExecutionRequest{
 		BinaryPath:                 p.parsedConfig.CustodianBinary,
 		Check:                      check,
 		Timeout:                    p.parsedConfig.CheckTimeout,
@@ -3025,14 +3114,27 @@ func (p *CloudCustodianPlugin) executionRequest(scope *evalScope, check Custodia
 		NetworkDiagnosticEndpoints: p.parsedConfig.CustodianNetworkDiagnosticEndpoints,
 		LogTailDuringRun:           p.parsedConfig.CustodianLogTail,
 	}
+	if account := scope.account; account != nil {
+		req.AccountID = account.ID
+		req.AssumeRoleARN = account.RoleARN
+		req.ExternalID = account.ExternalID
+		req.SessionNameSuffix = p.parsedConfig.AWSSessionNameSuffix
+		req.CachePath = custodianAccountCachePath(account.ID)
+	}
+	return req
 }
 
 func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, scope *evalScope) map[string]*InventoryBaseline {
 	baselines := map[string]*InventoryBaseline{}
 	for _, resourceType := range p.uniqueResourceTypes() {
+		if scope.assumeRoleFailure != nil {
+			scope.skippedRuns++
+			continue
+		}
 		check := buildInventoryCheck(resourceType)
 		outputDir := filepath.Join(scope.root, fmt.Sprintf("inventory-%s", sanitizeIdentifier(resourceType)))
 		execution := p.executor.Execute(ctx, p.executionRequest(scope, check, outputDir))
+		p.detectAssumeRoleFailure(scope, execution)
 
 		var baselineErr error
 		if execution.Err != nil || execution.Error != "" {
@@ -3040,6 +3142,12 @@ func (p *CloudCustodianPlugin) collectInventoryBaselines(ctx context.Context, sc
 		}
 		p.warnZeroResourceBaseline(check.Name, resourceType, execution)
 		records := p.buildExecutionRecords(resourceType, execution)
+		if scope.account != nil {
+			// Baselines belong to one account and are never merged across accounts.
+			for i := range records {
+				records[i].AccountID = scope.account.ID
+			}
+		}
 		collisionIDs := resourceIDCollisions(records)
 		_, collisionCount := disambiguateResourceRecords(records, collisionIDs)
 		baseline := &InventoryBaseline{
@@ -3170,7 +3278,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 		"policy_paths_count", len(policyPaths),
 	)
 	p.logPolicyPayload(payload)
-	labels := resourcePolicyLabels(p.parsedConfig.PolicyLabels)
+	labels := resourcePolicyLabels(p.parsedConfig.PolicyLabels, payload.Account != nil)
 	labels["source"] = sourceCloudCustodian
 	labels["tool"] = sourceCloudCustodian
 	if _, exists := labels["provider"]; !exists {
@@ -3196,6 +3304,14 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 		url.PathEscape(payload.Resource.Type),
 		url.PathEscape(payload.Resource.ID),
 	)
+	if payload.Account != nil {
+		resourceSubjectID = fmt.Sprintf(
+			"cloud-custodian-resource/%s/%s/%s",
+			url.PathEscape(payload.Account.ID),
+			url.PathEscape(payload.Resource.Type),
+			url.PathEscape(payload.Resource.ID),
+		)
+	}
 
 	actors := []*proto.OriginActor{
 		{
@@ -3308,6 +3424,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 			payload,
 		)
 		addResourceExplorerLinkToEvidence(evidences, payload, p.Logger)
+		addAccountNameLabel(evidences, payload)
 		allEvidences = append(allEvidences, evidences...)
 		if err != nil {
 			p.Logger.Warn("Policy path evaluation failed for resource",
@@ -3552,10 +3669,12 @@ func awsRegionFromARN(arn string) string {
 	return strings.TrimSpace(parts[3])
 }
 
-func resourcePolicyLabels(policyLabels map[string]string) map[string]string {
+// resourcePolicyLabels returns the configured policy_labels without the
+// reserved ones; in accounts mode account_id and account_name are reserved too.
+func resourcePolicyLabels(policyLabels map[string]string, accountsMode bool) map[string]string {
 	labels := map[string]string{}
 	for key, value := range policyLabels {
-		if isReservedResourceLabel(key) {
+		if isReservedResourceLabel(key) || (accountsMode && isAccountLabel(key)) {
 			continue
 		}
 		labels[key] = value
@@ -3763,6 +3882,7 @@ func composeZeroEvidenceError(accumulatedErrors error, diagnostics []executionDi
 // checkRunSummary is one row of the consolidated end-of-run summary emitted by
 // Eval, giving an operator a one-glance picture across every resource type.
 type checkRunSummary struct {
+	Account               string   `json:"account,omitempty"`
 	Check                 string   `json:"check"`
 	Resource              string   `json:"resource"`
 	ExitCode              int      `json:"exit_code"`
