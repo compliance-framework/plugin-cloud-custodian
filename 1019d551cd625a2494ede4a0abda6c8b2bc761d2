@@ -1,0 +1,7 @@
+lisa-design:
+- Layer 7 is split (spec allows it over 1000 lines): this layer (7a, ra/w2-c7n-accounts-exec) only teaches CommandCustodianExecutor the account fields; 7b (ra/w2-c7n-accounts-eval) fills them from aws_accounts in Eval and adds labels, identity and failure aggregation. Until 7b the new request fields are never set, so behaviour is unchanged.
+- Account flags are request fields (AccountID, AssumeRoleARN, ExternalID, SessionNameSuffix, CachePath), all empty outside accounts mode, so a no-accounts command line and environment are byte-for-byte today's (pinned by a test).
+- --assume/--external-id are added only for AWS checks (provider aws), like --region; c7n's --assume also means "service account" for other providers, so an AWS role ARN must never reach them.
+- C7N_SESSION_SUFFIX and CCF_CUSTODIAN_ACCOUNT_ID are only exported when set; the API-trace shim adds account_id to a record only when CCF_CUSTODIAN_ACCOUNT_ID is non-empty, so single-account traces are unchanged.
+- Redaction: both custodian argument logs go through redactCustodianArgs (value after --external-id, and --external-id=...). c7n itself never prints the external ID: with the plugin's single -v, c7n keeps botocore at ERROR (cli.py _setup_logger), and the trace shim logs no API params; so stdout/stderr are not scrubbed (scrubbing a 2-character ID would mangle output).
+- Per-account cache file <TMPDIR>/cloud-custodian-<id>.cache (custodianAccountCachePath); 7b uses it for ambient accounts too (c7n keys its cache by account anyway, a separate file just removes any doubt).
