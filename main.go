@@ -358,6 +358,18 @@ type CustodianExecutionRequest struct {
 	NetworkDiagnostics         bool
 	NetworkDiagnosticEndpoints []string
 	LogTailDuringRun           bool
+	// The account fields are set only in accounts mode (aws_accounts).
+	// AccountID is exported as CCF_CUSTODIAN_ACCOUNT_ID for the API trace.
+	AccountID string
+	// AssumeRoleARN is passed to AWS checks as --assume; empty runs with the
+	// ambient credentials.
+	AssumeRoleARN string
+	// ExternalID goes with AssumeRoleARN as --external-id. Never log it.
+	ExternalID string
+	// SessionNameSuffix is exported as C7N_SESSION_SUFFIX when set.
+	SessionNameSuffix string
+	// CachePath replaces c7n's --cache file; empty uses custodianCachePath().
+	CachePath string
 }
 
 // CustodianExecutionResult captures runtime output and artifacts from one check run.
@@ -438,6 +450,30 @@ func custodianCachePath() string {
 	return filepath.Join(os.TempDir(), "cloud-custodian.cache")
 }
 
+// custodianAccountCachePath is the c7n cache file of one AWS account in
+// accounts mode, so accounts never share cached resources.
+func custodianAccountCachePath(accountID string) string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cloud-custodian-%s.cache", accountID))
+}
+
+const redactedArgValue = "<redacted>"
+
+// redactCustodianArgs returns a copy of a custodian command line that is safe
+// to log: the --external-id value is replaced.
+func redactCustodianArgs(args []string) []string {
+	redacted := slices.Clone(args)
+	for i := 0; i < len(redacted); i++ {
+		switch {
+		case redacted[i] == "--external-id" && i+1 < len(redacted):
+			redacted[i+1] = redactedArgValue
+			i++
+		case strings.HasPrefix(redacted[i], "--external-id="):
+			redacted[i] = "--external-id=" + redactedArgValue
+		}
+	}
+	return redacted
+}
+
 // defaultDebugPayloadOutputDir is where standardized debug payloads are written
 // when dumping is enabled without an explicit debug_payload_output_dir. The CCF
 // agent may run each plugin with its own working directory, so plugins must not
@@ -471,6 +507,8 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		"timeout", req.Timeout.String(),
 		"output_dir", req.OutputDir,
 		"aws_regions", req.AWSRegions,
+		"account_id", req.AccountID,
+		"assume_role_arn", req.AssumeRoleARN,
 	)
 	result := CustodianExecutionResult{
 		StartedAt:    time.Now().UTC(),
@@ -575,7 +613,18 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	// read-only root filesystem that makedirs fails with "Read-only file
 	// system". os.TempDir honors TMPDIR and otherwise resolves to /tmp, which
 	// the agent deployment mounts as a writable emptyDir.
-	args = append(args, "--dryrun", "-s", req.OutputDir, "--cache", custodianCachePath(), policyPath)
+	cachePath := req.CachePath
+	if cachePath == "" {
+		cachePath = custodianCachePath()
+	}
+	args = append(args, "--dryrun", "-s", req.OutputDir, "--cache", cachePath)
+	if req.AssumeRoleARN != "" && strings.EqualFold(req.Check.Provider, "aws") {
+		args = append(args, "--assume", req.AssumeRoleARN)
+		if req.ExternalID != "" {
+			args = append(args, "--external-id", req.ExternalID)
+		}
+	}
+	args = append(args, policyPath)
 	if strings.EqualFold(req.Check.Provider, "aws") {
 		for _, region := range regions {
 			args = append(args, "--region", region)
@@ -583,6 +632,13 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 	}
 	cmd := exec.CommandContext(runCtx, req.BinaryPath, args...)
 	cmd.Env = os.Environ()
+	if req.SessionNameSuffix != "" {
+		// c7n names its STS sessions CloudCustodian@<suffix>.
+		cmd.Env = upsertEnv(cmd.Env, "C7N_SESSION_SUFFIX", req.SessionNameSuffix)
+	}
+	if req.AccountID != "" {
+		cmd.Env = upsertEnv(cmd.Env, "CCF_CUSTODIAN_ACCOUNT_ID", req.AccountID)
+	}
 	if req.AWSAPITrace {
 		traceDir, traceLogPath, traceErr := setupCustodianAWSAPITrace(req.OutputDir)
 		if traceErr != nil {
@@ -598,7 +654,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		"check_name", req.Check.Name,
 		"resource", req.Check.Resource,
 		"command", req.BinaryPath,
-		"args", args,
+		"args", redactCustodianArgs(args),
 		"aws_regions", regions,
 	)
 	stdoutBuf := &lockedBuffer{}
@@ -704,7 +760,7 @@ func (e *CommandCustodianExecutor) Execute(ctx context.Context, req CustodianExe
 		e.Logger.Warn("Failed to start custodian command process",
 			"check_name", req.Check.Name,
 			"command", req.BinaryPath,
-			"args", args,
+			"args", redactCustodianArgs(args),
 			"error", err,
 		)
 	}
@@ -820,6 +876,9 @@ import time
 
 def _ccf_trace_write(record):
     record["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    account_id = os.environ.get("CCF_CUSTODIAN_ACCOUNT_ID")
+    if account_id:
+        record["account_id"] = account_id
     line = json.dumps(record, sort_keys=True, default=str)
     path = os.environ.get("CCF_CUSTODIAN_AWS_API_TRACE_LOG")
     if path:
