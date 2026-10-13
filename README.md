@@ -50,7 +50,7 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `aws_regions` | No | Comma or whitespace separated AWS regions passed as repeated `--region` flags. Duplicate entries are removed while preserving order. Default: unset, which falls back to `--region all` for AWS checks. |
 | `check_timeout_seconds` | No | Per-check timeout in seconds. Default: `300`. |
 | `policy_labels` | No | JSON map of labels merged into generated evidence labels. |
-| `resource_identity_fields` | No | JSON object mapping Cloud Custodian resource types to ordered identity field paths. Built-in defaults are used after configured fields. Example: `{"aws.ec2":["InstanceId","Arn"]}`. |
+| `resource_identity_fields` | No | JSON object mapping Cloud Custodian resource types to ordered identity field paths. Built-in defaults (see [Resource Identity](#resource-identity)) are used after configured fields. Example: `{"aws.ec2":["InstanceId","Arn"]}`. |
 | `debug_dump_payloads` | No | Boolean (`true`/`false`) toggle to write standardized resource payload JSON files for troubleshooting. Default: `false`. |
 | `debug_payload_output_dir` | No | Directory where debug payload JSON files are written. If set, debug dumping is auto-enabled. Default when enabled without explicit path: `ccf-custodian-debug-payloads` under the OS temp directory (`$TMPDIR`, else `/tmp`), e.g. `/tmp/ccf-custodian-debug-payloads`. Use an absolute path: a relative value is still honoured but resolves against the plugin process working directory (which the agent may set per plugin) and logs a warning. The resolved absolute path is logged at `INFO` when dumping is enabled. |
 | `preserve_execution_artifacts` | No | Boolean (`true`/`false`) toggle to keep the temporary Cloud Custodian execution root after a check execution failure for postmortem review. Default: `false`. |
@@ -170,6 +170,52 @@ zone identifiers such as `/hostedzone/Z123` are normalized to full ARNs such as
 inventory run. If a policy returns a resource that is not present in the baseline,
 the plugin still evaluates it as `non_compliant` and sets
 `inventory_status` to `missing_from_baseline`.
+
+### Resource Identity
+
+`resource.id` (and the `resource_id` label) is the first non-empty field from, in order:
+
+1. the type's `resource_identity_fields`, when configured;
+2. the built-in field list for the AWS type below: the ARN first, then the natural id, following
+   the resource metadata of Cloud Custodian 0.9.49;
+3. the generic fields `Arn`, `ARN`, `arn`, `Id`, `ID`, `id`, `InstanceId`, `instance_id`, `InstanceID`,
+   `ResourceId`, `resource_id`, `Name`, `name`;
+4. a SHA-256 of the whole resource, as a last resort.
+
+| Type | Fields |
+| --- | --- |
+| `aws.app-elb` | `LoadBalancerArn` |
+| `aws.backup-plan` | `BackupPlanArn`, `BackupPlanName` |
+| `aws.backup-vault` | `BackupVaultArn`, `BackupVaultName` |
+| `aws.cache-cluster` | `ARN`, `CacheClusterId` |
+| `aws.distribution` | `ARN`, `Id` |
+| `aws.dynamodb-table` | `TableArn`, `TableName` |
+| `aws.ebs` | `VolumeId` |
+| `aws.ec2` | `InstanceId` |
+| `aws.ecs-service` | `serviceArn` |
+| `aws.efs` | `FileSystemArn`, `FileSystemId` |
+| `aws.eks` | `arn`, `name` |
+| `aws.firewall` | `FirewallArn`, `FirewallName` |
+| `aws.hostedzone` | `Id` (normalized to an ARN) |
+| `aws.iam-group` | `Arn`, `GroupName` |
+| `aws.iam-policy` | `Arn`, `PolicyId` |
+| `aws.iam-role` | `Arn`, `RoleName` |
+| `aws.iam-user` | `Arn`, `UserName` |
+| `aws.kms-key` | `Arn`, `KeyId` |
+| `aws.lambda` | `FunctionArn`, `FunctionName` |
+| `aws.log-group` | `arn`, `logGroupName` |
+| `aws.rds` | `DBInstanceArn`, `DBInstanceIdentifier` |
+| `aws.rds-cluster` | `DBClusterArn`, `DBClusterIdentifier` |
+| `aws.s3` | `Name` |
+| `aws.secrets-manager` | `ARN`, `Name` |
+| `aws.sns` | `TopicArn` |
+| `aws.sqs` | `QueueArn`, `QueueUrl` |
+| `aws.transfer-server` | `Arn`, `ServerId` |
+| `aws.wafv2` | `ARN`, `Id` |
+
+The id never depends on the annotations Cloud Custodian adds to matched resources
+(`c7n:MatchedFilters` and the like), so a check's matched resource is the same
+resource as its inventory baseline record.
 
 `provider` extraction rule:
 
