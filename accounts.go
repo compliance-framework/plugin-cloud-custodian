@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 
+	"github.com/compliance-framework/agent/runner"
+	"github.com/compliance-framework/agent/runner/proto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -308,4 +312,256 @@ func ignoredAWSAccountKeys(c *PluginConfig) []string {
 		}
 	}
 	return keys
+}
+
+const (
+	// c7n logs this and exits 1 when --assume fails (c7n commands.py run).
+	custodianAssumeRoleFailureMessage = "Unable to assume role"
+	// Bounds of the aggregated accounts error: the first part of each
+	// account's error messages, each account's whole section, and all sections.
+	accountErrorMessageCap  = 2 * 1024
+	accountFailureDetailCap = 16 * 1024
+	accountFailuresCap      = 128 * 1024
+)
+
+// accountsMode reports whether aws_accounts is set.
+func (p *CloudCustodianPlugin) accountsMode() bool {
+	return p.parsedConfig != nil && len(p.parsedConfig.AWSAccounts) > 0
+}
+
+// accountScanRegions are the regions of one account: its own, else aws_regions
+// (empty means all).
+func accountScanRegions(account AWSAccount, defaultRegions []string) []string {
+	if len(account.Regions) > 0 {
+		return account.Regions
+	}
+	return defaultRegions
+}
+
+// scansAllRegions mirrors the executor: no regions means c7n's "all".
+func scansAllRegions(regions []string) bool {
+	return len(regions) == 0 || slices.Contains(regions, "all")
+}
+
+// accountFailure is everything Eval reports about one failed account.
+type accountFailure struct {
+	account          AWSAccount
+	assumeRoleFailed bool
+	skippedRuns      int
+	err              error
+	// diagnostics are the account's failed executions, with output tails.
+	diagnostics []executionDiagnostic
+}
+
+// evalAccounts scans every account in aws_accounts, one after the other. An
+// account's failure doesn't stop the others: they still submit their
+// evidence, and Eval then fails with every failed account's error and output.
+func (p *CloudCustodianPlugin) evalAccounts(ctx context.Context, req *proto.EvalRequest, apiHelper runner.ApiHelper, executionRoot string, run *evalRun) (*proto.EvalResponse, error) {
+	// A policy entry that didn't parse fails the same way in every account.
+	for _, check := range p.checks {
+		if len(check.ParseErrors) > 0 {
+			p.recordCheckParseErrors(run, check)
+		}
+	}
+
+	accounts := p.parsedConfig.AWSAccounts
+	failures := make([]accountFailure, 0)
+	for i := range accounts {
+		account := accounts[i]
+		scope := &evalScope{
+			account: &account,
+			root:    filepath.Join(executionRoot, "acct-"+account.ID),
+			regions: accountScanRegions(account, p.parsedConfig.AWSRegions),
+		}
+		p.Logger.Info("Scanning AWS account",
+			"account_id", account.ID,
+			"account_name", account.Name,
+			"role_arn", account.RoleARN,
+			"use_ambient_credentials", account.UseAmbientCredentials,
+			"aws_regions", scope.regions,
+		)
+		if scansAllRegions(scope.regions) {
+			p.Logger.Warn("Scanning all regions of an AWS account: Cloud Custodian lists the regions with the plugin's own credentials, so regions enabled only in this account can be missed; set the account's regions or aws_regions to scan them",
+				"account_id", account.ID,
+				"account_name", account.Name,
+			)
+		}
+
+		accountRun := newEvalRun()
+		if err := p.evalScope(ctx, req, apiHelper, scope, accountRun); err != nil {
+			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
+		}
+		if err := p.flushEvidence(ctx, apiHelper, accountRun); err != nil {
+			return &proto.EvalResponse{Status: proto.ExecutionStatus_FAILURE}, err
+		}
+		run.totalEvidenceCount += accountRun.totalEvidenceCount
+		run.successfulPolicyRuns += accountRun.successfulPolicyRuns
+		run.hadCheckExecutionFailures = run.hadCheckExecutionFailures || accountRun.hadCheckExecutionFailures
+		run.executionDiagnostics = append(run.executionDiagnostics, accountRun.executionDiagnostics...)
+		run.runSummaries = append(run.runSummaries, accountRun.runSummaries...)
+
+		if scope.assumeRoleFailure == nil && !accountRun.hadCheckExecutionFailures {
+			if accountRun.accumulatedErrors != nil {
+				// Non-fatal policy evaluation errors, as in single-account mode.
+				run.accumulatedErrors = errors.Join(run.accumulatedErrors, fmt.Errorf("AWS account %s: %w", account.Label(), accountRun.accumulatedErrors))
+			}
+			continue
+		}
+		failure := accountFailure{
+			account:          account,
+			assumeRoleFailed: scope.assumeRoleFailure != nil,
+			skippedRuns:      scope.skippedRuns,
+			err:              accountRun.accumulatedErrors,
+		}
+		for _, diagnostic := range accountRun.executionDiagnostics {
+			if diagnostic.hadError {
+				failure.diagnostics = append(failure.diagnostics, diagnostic)
+			}
+		}
+		p.Logger.Error("Cloud Custodian scan of an AWS account failed; continuing with the other accounts",
+			"account_id", account.ID,
+			"account_name", account.Name,
+			"assume_role_failed", failure.assumeRoleFailed,
+			"skipped_runs", failure.skippedRuns,
+			"error", failure.detail(),
+		)
+		failures = append(failures, failure)
+	}
+
+	if run.totalEvidenceCount == 0 {
+		p.Logger.Warn("No evidence generated by current evaluation run")
+	}
+	return p.evalOutcome(run, formatAccountFailures(failures, len(accounts)))
+}
+
+// detectAssumeRoleFailure marks the scope when c7n couldn't assume its
+// account's role, so the account's remaining runs are skipped.
+func (p *CloudCustodianPlugin) detectAssumeRoleFailure(scope *evalScope, execution CustodianExecutionResult) {
+	if scope.account == nil || scope.account.RoleARN == "" || scope.assumeRoleFailure != nil || !isAssumeRoleFailure(execution) {
+		return
+	}
+	scope.assumeRoleFailure = &execution
+	p.Logger.Error("Cloud Custodian could not assume the AWS account's role; skipping the account's remaining runs",
+		"account_id", scope.account.ID,
+		"account_name", scope.account.Name,
+		"role_arn", scope.account.RoleARN,
+		"stderr_tail", tailString(execution.Stderr, custodianOutputTailBytes),
+	)
+}
+
+func isAssumeRoleFailure(execution CustodianExecutionResult) bool {
+	if execution.ExitCode != 1 {
+		return false
+	}
+	return strings.Contains(execution.Stderr, custodianAssumeRoleFailureMessage) ||
+		strings.Contains(execution.Stdout, custodianAssumeRoleFailureMessage) ||
+		strings.Contains(execution.LogTail, custodianAssumeRoleFailureMessage)
+}
+
+// setPayloadAccount makes the scanned account the resource's account,
+// overriding any account found in the resource data.
+func setPayloadAccount(payload *StandardizedResourcePayload, account AWSAccount) {
+	payload.Resource.AccountID = account.ID
+	payload.Account = &StandardizedAccountInfo{ID: account.ID, Name: account.Name}
+}
+
+// detail renders one failed account: its role, why it failed, the start of
+// its error messages and the output tails of its failed runs.
+func (f accountFailure) detail() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "=== AWS account %s ===\n", f.account.Label())
+	if f.account.RoleARN != "" {
+		fmt.Fprintf(&sb, "role: %s\n", f.account.RoleARN)
+	} else {
+		sb.WriteString("credentials: ambient\n")
+	}
+	if f.assumeRoleFailed {
+		fmt.Fprintf(&sb, "could not assume the role; skipped the account's %d remaining custodian run(s)\n", f.skippedRuns)
+	}
+	if f.err != nil {
+		sb.WriteString(headString(strings.TrimSpace(f.err.Error()), accountErrorMessageCap))
+		sb.WriteString("\n")
+	}
+	for _, diagnostic := range f.diagnostics {
+		sb.WriteString(formatExecutionDiagnosticDetail(diagnostic))
+	}
+	return headString(strings.TrimSpace(sb.String()), accountFailureDetailCap)
+}
+
+// formatAccountFailures aggregates the failed accounts into Eval's error. Its
+// first line names every failed account, so the agent's run status says which
+// accounts failed even when the details are cut to bound the error size.
+func formatAccountFailures(failures []accountFailure, accountCount int) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	labels := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		label := failure.account.Label()
+		if failure.assumeRoleFailed {
+			label += " [could not assume role]"
+		}
+		labels = append(labels, label)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "cloud custodian failed in %d of %d AWS account(s): %s", len(failures), accountCount, strings.Join(labels, ", "))
+	if succeeded := accountCount - len(failures); succeeded > 0 {
+		fmt.Fprintf(&sb, "; evidence from the other %d account(s) was submitted", succeeded)
+	}
+	omitted := 0
+	for _, failure := range failures {
+		detail := failure.detail()
+		if sb.Len()+len(detail)+1 > accountFailuresCap {
+			omitted++
+			continue
+		}
+		sb.WriteString("\n")
+		sb.WriteString(detail)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&sb, "\n(details of %d more failed account(s) omitted to bound the error size; see the plugin log)", omitted)
+	}
+	return errors.New(sb.String())
+}
+
+// headString returns at most the first maxBytes bytes of s, marking the cut.
+func headString(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxBytes], "") + "\n... (truncated)"
+}
+
+func isAccountLabel(label string) bool {
+	return label == "account_id" || label == "account_name"
+}
+
+// ignoredAccountPolicyLabels lists the policy_labels keys that accounts mode
+// reserves.
+func ignoredAccountPolicyLabels(parsed *ParsedConfig) []string {
+	if len(parsed.AWSAccounts) == 0 {
+		return nil
+	}
+	ignored := make([]string, 0)
+	for _, key := range sortedKeys(parsed.PolicyLabels) {
+		if isAccountLabel(key) {
+			ignored = append(ignored, key)
+		}
+	}
+	return ignored
+}
+
+// validateAccountsModeChecks rejects non-AWS policies in accounts mode: the
+// accounts and their roles only mean something to AWS policies.
+func validateAccountsModeChecks(parsed *ParsedConfig, checks []CustodianCheck) error {
+	if len(parsed.AWSAccounts) == 0 {
+		return nil
+	}
+	for _, check := range checks {
+		if len(check.ParseErrors) > 0 || strings.EqualFold(check.Provider, "aws") {
+			continue
+		}
+		return fmt.Errorf("aws_accounts scans AWS policies only; policy %q uses resource %q", check.Name, check.Resource)
+	}
+	return nil
 }
