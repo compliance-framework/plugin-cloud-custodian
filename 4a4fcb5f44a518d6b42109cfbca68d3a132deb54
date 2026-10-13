@@ -1,0 +1,5 @@
+lisa-design:
+- Manifest seeded at 0.2.8: releases/latest is v0.2.8 (final, ancestor of main). v0.2.8-rc1 points at the same commit but is not a final release, so it is not the seed.
+- Callers copied verbatim from mock-plugin-1 (cut-prerelease from mock-plugin-policies-1), pins moved to workflows v1.5.2; byte-identical to the reviewed pilot (plugin-github-repositories#26) except branches [main].
+- release.yml passes protocol-version "2": main.go serves runner.RunnerV2GRPCPlugin. Old uploads had no protocol annotation, so agents without protocol_version in config ran it as v1; new releases make them run v2 (Init is called). Intended, reported for humans.
+- .goreleaser.yaml only gains release: {prerelease: auto, replace_existing_artifacts: true}; builds/archives untouched (now identical to mock-plugin-1's). The default archive glob picks readme_accounts_test.go (readme*) since #34; pre-existing, left as is per spec (keep archive contents).
