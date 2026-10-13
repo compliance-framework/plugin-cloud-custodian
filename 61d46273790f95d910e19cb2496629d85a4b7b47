@@ -1,0 +1,2 @@
+lisa-addressed:
+pass 1: role_arn now uses the IAM role name/path character set; test added.
