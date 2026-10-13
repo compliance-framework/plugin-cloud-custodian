@@ -17,6 +17,7 @@ import (
 
 	"github.com/compliance-framework/agent/runner/proto"
 	"github.com/hashicorp/go-hclog"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func stubLookPath(t *testing.T, fn func(string) (string, error)) {
@@ -1740,10 +1741,11 @@ func (f *fakeExecutor) Execute(ctx context.Context, req CustodianExecutionReques
 }
 
 type fakePolicyEvaluator struct {
-	calls        []string
-	failChecks   map[string]bool
-	labelsSeen   []map[string]string
-	subjectsSeen [][]*proto.Subject
+	calls          []string
+	failChecks     map[string]bool
+	labelsSeen     []map[string]string
+	subjectsSeen   [][]*proto.Subject
+	policyDataSeen []map[string]interface{}
 }
 
 func (f *fakePolicyEvaluator) Generate(
@@ -1755,6 +1757,7 @@ func (f *fakePolicyEvaluator) Generate(
 	inventory []*proto.InventoryItem,
 	actors []*proto.OriginActor,
 	activities []*proto.Activity,
+	policyData map[string]interface{},
 	data interface{},
 ) ([]*proto.Evidence, error) {
 	payload, ok := data.(*StandardizedResourcePayload)
@@ -1769,6 +1772,7 @@ func (f *fakePolicyEvaluator) Generate(
 	}
 	f.labelsSeen = append(f.labelsSeen, copiedLabels)
 	f.subjectsSeen = append(f.subjectsSeen, subjects)
+	f.policyDataSeen = append(f.policyDataSeen, policyData)
 	if f.failChecks[payload.Check.Name] {
 		return nil, errors.New("forced evaluator error")
 	}
@@ -2412,6 +2416,91 @@ func TestConfigureLoadsChecks(t *testing.T) {
 	}
 	if plugin.parsedConfig.PolicyLabels["environment"] != "dev" {
 		t.Fatalf("expected parsed policy label")
+	}
+}
+
+func TestConfigureStoresPolicyData(t *testing.T) {
+	stubLookPath(t, func(binary string) (string, error) {
+		return "/usr/local/bin/" + binary, nil
+	})
+
+	config := map[string]string{
+		"policies_yaml": `policies:
+  - name: s3-check
+    resource: aws.s3`,
+	}
+	policyData, err := structpb.NewStruct(map[string]interface{}{
+		"allowed_regions": []interface{}{"eu-west-1", "us-east-1"},
+		"max_age_days":    float64(90),
+	})
+	if err != nil {
+		t.Fatalf("unexpected structpb error: %v", err)
+	}
+
+	plugin := &CloudCustodianPlugin{Logger: hclog.NewNullLogger()}
+	if _, err := plugin.Configure(&proto.ConfigureRequest{Config: config, PolicyData: policyData}); err != nil {
+		t.Fatalf("unexpected configure error: %v", err)
+	}
+	regions, ok := plugin.policyData["allowed_regions"].([]interface{})
+	if !ok || len(regions) != 2 || regions[0] != "eu-west-1" || regions[1] != "us-east-1" {
+		t.Fatalf("expected allowed_regions to be stored, got %#v", plugin.policyData)
+	}
+	if plugin.policyData["max_age_days"] != float64(90) {
+		t.Fatalf("expected max_age_days to be stored, got %#v", plugin.policyData)
+	}
+
+	// Reconfiguring without policy_data clears what an earlier Configure stored.
+	if _, err := plugin.Configure(&proto.ConfigureRequest{Config: config}); err != nil {
+		t.Fatalf("unexpected configure error: %v", err)
+	}
+	if plugin.policyData != nil {
+		t.Fatalf("expected policy data to be cleared, got %#v", plugin.policyData)
+	}
+}
+
+func TestEvalPassesPolicyDataToEvaluator(t *testing.T) {
+	now := time.Now().UTC()
+	executor := &fakeExecutor{results: map[string]CustodianExecutionResult{
+		"inventory-aws-s3": {
+			StartedAt: now,
+			EndedAt:   now.Add(5 * time.Millisecond),
+			ExitCode:  0,
+			Resources: []interface{}{map[string]interface{}{"id": "bucket-1"}},
+		},
+		"check-a": {
+			StartedAt: now,
+			EndedAt:   now.Add(5 * time.Millisecond),
+			ExitCode:  0,
+			Resources: []interface{}{map[string]interface{}{"id": "bucket-1"}},
+		},
+	}}
+	evaluator := &fakePolicyEvaluator{}
+	policyData := map[string]interface{}{"owner": "platform"}
+
+	plugin := &CloudCustodianPlugin{
+		Logger: hclog.NewNullLogger(),
+		parsedConfig: &ParsedConfig{
+			PolicyLabels: map[string]string{},
+			CheckTimeout: 30 * time.Second,
+		},
+		checks: []CustodianCheck{
+			{Index: 0, Name: "check-a", Resource: "aws.s3", Provider: "aws", RawPolicy: map[string]interface{}{"name": "check-a", "resource": "aws.s3"}},
+		},
+		policyData: policyData,
+		executor:   executor,
+		evaluator:  evaluator,
+	}
+
+	if _, err := plugin.Eval(&proto.EvalRequest{PolicyPaths: []string{"bundle-a"}}, &fakeAPIHelper{}); err != nil {
+		t.Fatalf("unexpected eval error: %v", err)
+	}
+	if len(evaluator.policyDataSeen) == 0 {
+		t.Fatalf("expected at least one policy evaluation")
+	}
+	for i, seen := range evaluator.policyDataSeen {
+		if seen["owner"] != "platform" {
+			t.Fatalf("evaluation %d: expected policy data %#v, got %#v", i, policyData, seen)
+		}
 	}
 }
 

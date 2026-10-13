@@ -170,6 +170,21 @@ the plugin still evaluates it as `non_compliant` and sets
 - `aws.s3` -> `aws`
 - non `<provider>.<resource>` formats -> `unknown`
 
+## Policy Data
+
+Any `policy_data` set on this plugin's block in the agent configuration is passed
+to every policy evaluation and is available to Rego as `data.<key>`:
+
+```yaml
+plugins:
+  cloud_custodian:
+    # ...plugin settings as above...
+    policy_data:
+      allowed_regions:
+        - eu-west-1
+        - us-east-1
+```
+
 ## Operational Prerequisites
 
 - Cloud Custodian CLI must be installed and executable.

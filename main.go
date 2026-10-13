@@ -2244,6 +2244,7 @@ type PolicyEvaluator interface {
 		inventory []*proto.InventoryItem,
 		actors []*proto.OriginActor,
 		activities []*proto.Activity,
+		policyData map[string]interface{},
 		data interface{},
 	) ([]*proto.Evidence, error)
 }
@@ -2261,6 +2262,7 @@ func (e *DefaultPolicyEvaluator) Generate(
 	inventory []*proto.InventoryItem,
 	actors []*proto.OriginActor,
 	activities []*proto.Activity,
+	policyData map[string]interface{},
 	data interface{},
 ) ([]*proto.Evidence, error) {
 	e.Logger.Debug("Evaluating OPA policy against check payload", "policy_path", policyPath, "labels", labels)
@@ -2272,6 +2274,7 @@ func (e *DefaultPolicyEvaluator) Generate(
 		inventory,
 		actors,
 		activities,
+		policyData,
 	)
 	evidence, err := processor.GenerateResults(ctx, policyPath, data)
 	if err != nil {
@@ -2288,6 +2291,9 @@ type CloudCustodianPlugin struct {
 	config       *PluginConfig
 	parsedConfig *ParsedConfig
 	checks       []CustodianCheck
+	// policyData is the ConfigureRequest's policy_data, passed to every policy evaluation
+	// (available to Rego as data.<key>); nil when unset.
+	policyData map[string]interface{}
 
 	executor  CustodianExecutor
 	evaluator PolicyEvaluator
@@ -2347,6 +2353,11 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 	p.config = config
 	p.parsedConfig = parsed
 	p.checks = checks
+	if policyData := req.GetPolicyData(); policyData != nil {
+		p.policyData = policyData.AsMap()
+	} else {
+		p.policyData = nil
+	}
 
 	if parsed.DebugDumpPayloads {
 		if !filepath.IsAbs(parsed.DebugPayloadOutputDir) {
@@ -3015,6 +3026,7 @@ func (p *CloudCustodianPlugin) evaluateResourcePolicies(
 			inventory,
 			actors,
 			activities,
+			p.policyData,
 			payload,
 		)
 		addResourceExplorerLinkToEvidence(evidences, payload, p.Logger)
