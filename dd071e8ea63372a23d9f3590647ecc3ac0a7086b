@@ -1,0 +1,2 @@
+lisa-addressed:
+- CORE-DUP-001 c4ec9d95a1b9: TestREADMEIdentityTableMatchesCode parses the README Resource Identity rows and compares them with awsResourceIdentityFields (verified it fails when a README row is edited).
