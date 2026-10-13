@@ -54,6 +54,11 @@ All plugin config fields are strings (agent gRPC `map<string,string>` contract).
 | `debug_dump_payloads` | No | Boolean (`true`/`false`) toggle to write standardized resource payload JSON files for troubleshooting. Default: `false`. |
 | `debug_payload_output_dir` | No | Directory where debug payload JSON files are written. If set, debug dumping is auto-enabled. Default when enabled without explicit path: `ccf-custodian-debug-payloads` under the OS temp directory (`$TMPDIR`, else `/tmp`), e.g. `/tmp/ccf-custodian-debug-payloads`. Use an absolute path: a relative value is still honoured but resolves against the plugin process working directory (which the agent may set per plugin) and logs a warning. The resolved absolute path is logged at `INFO` when dumping is enabled. |
 | `preserve_execution_artifacts` | No | Boolean (`true`/`false`) toggle to keep the temporary Cloud Custodian execution root after a check execution failure for postmortem review. Default: `false`. |
+| `aws_accounts` | No | JSON (or YAML) array of AWS accounts to scan: `{"id", "name", "role_arn", "role_name", "external_id", "regions", "use_ambient_credentials"}`, only `id` required. See [Cross-Account Scanning](#cross-account-scanning). Default: unset, which scans the account of the plugin's own credentials. |
+| `aws_assume_role_name` | No | Role name assumed in every account without its own `role_arn` or `role_name`. Only used with `aws_accounts`. |
+| `aws_external_id` | No | External ID passed when assuming a role in an account without its own `external_id`. Only used with `aws_accounts`. Never logged. |
+| `aws_partition` | No | Partition of the role ARNs built from role names (`aws`, `aws-cn`, `aws-us-gov`, ...). Only used with `aws_accounts`. Default: derived from the account's regions (`cn-*` is `aws-cn`, `us-gov-*` is `aws-us-gov`), else `aws`. |
+| `aws_session_name_suffix` | No | Suffix of the STS session name, `CloudCustodian@<suffix>` (`C7N_SESSION_SUFFIX`). Only used with `aws_accounts`. Default: `ccf`. |
 
 Validation rules:
 
@@ -62,6 +67,7 @@ Validation rules:
 - `check_timeout_seconds` must be a positive integer.
 - `resource_identity_fields`, when set, must be valid JSON and each resource type must include at least one field path.
 - Policy YAML must include top-level `policies` array.
+- With `aws_accounts`: every account `id` is 12 digits and listed once; each account has a role (`role_arn`, `role_name` or `aws_assume_role_name`) or `use_ambient_credentials: true`, but not its own role and ambient credentials together, and at most one account uses ambient credentials; a `role_arn` belongs to its account; an external ID is 2 to 1224 characters from `[A-Za-z0-9_+=,.@:/-]`; unknown account keys are rejected; every policy is an AWS policy. Without `aws_accounts`, the other `aws_*` account keys are ignored with a warning.
 
 ## Example Agent Config (Inline YAML)
 
@@ -97,6 +103,99 @@ plugins:
       policies_path: file:///etc/ccf/cloud-custodian.yaml
       custodian_binary: /usr/local/bin/custodian
 ```
+
+## Cross-Account Scanning
+
+Without `aws_accounts` the plugin scans the account of its own (ambient) credentials, exactly as before. With
+`aws_accounts`, it scans only the listed accounts, one after the other, assuming a role in each through Cloud
+Custodian's `--assume` and `--external-id`. The account the plugin runs in (the hub) is scanned only when it is
+listed with `use_ambient_credentials: true`.
+
+For each account:
+
+- the role is the entry's `role_arn`, else `arn:<partition>:iam::<id>:role/<role_name>`, else the same with
+  `aws_assume_role_name`;
+- the external ID is the entry's `external_id`, else `aws_external_id`;
+- the regions are the entry's `regions`, else `aws_regions`, else `all`.
+
+```yaml
+plugins:
+  cloud_custodian:
+    source: ghcr.io/compliance-framework/plugin-cloud-custodian:<version>
+    policies:
+      - ghcr.io/compliance-framework/plugin-cloud-custodian-policies:<version>
+    config:
+      policies_path: file:///etc/ccf/cloud-custodian.yaml
+      aws_regions: "eu-west-1,us-east-1"
+      aws_assume_role_name: ccf-audit
+      aws_external_id: "${env:CCF_CUSTODIAN_EXTERNAL_ID}"
+      aws_accounts: |
+        [
+          {"id": "111111111111", "name": "hub", "use_ambient_credentials": true},
+          {"id": "222222222222", "name": "prod", "role_name": "ccf-prod-audit", "external_id": "${env:CCF_PROD_EXTERNAL_ID}"},
+          {"id": "333333333333", "name": "dev", "regions": ["eu-west-1"]},
+          {"id": "444444444444", "name": "legacy", "role_arn": "arn:aws:iam::444444444444:role/security/ccf-audit"}
+        ]
+```
+
+Here the hub uses the agent's own credentials; prod assumes `ccf-prod-audit` with its own external ID; dev assumes
+`ccf-audit` with the global external ID in `eu-west-1` only; legacy assumes the given role with the global external ID. The agent resolves the
+`${env:...}` placeholders before the plugin sees them.
+
+What changes in accounts mode:
+
+- The `account_id` label is the scanned account, whatever the resource data says, and `account_name` is added when the
+  account has a `name`. Both are reserved: `policy_labels` can't set them.
+- The payload gets `"account": {"id": "...", "name": "..."}`, and `resource.account_id` is the scanned account.
+- `account_id` is part of the evidence UUID seed and of the resource subject id
+  (`cloud-custodian-resource/<account>/<type>/<id>`), and the subject templates' identity keys are
+  `provider`, `account_id`, `resource_type`, `resource_id`. The same resource id in two accounts is two resources.
+  Moving an existing deployment to `aws_accounts` therefore re-keys its evidence streams once.
+- Each account has its own inventory baseline, Cloud Custodian cache file and output directory.
+
+When an account fails (for example its role can't be assumed, which skips the account's remaining runs), the other
+accounts still run and submit their evidence. The run then fails with one error whose first line names every failed
+account, followed, per account, by its role, its errors and the tail of Cloud Custodian's output. The agent records that
+error as the plugin run's error (its log and the agent run evidence).
+
+### Regions
+
+With `all` (no `regions` and no `aws_regions`), Cloud Custodian lists the enabled regions with the hub's credentials
+(`ec2:DescribeRegions`), not the target account's, so an opt-in region enabled only in a target account is missed. The
+plugin logs a warning for each such account; list the regions to scan them. On private networks without a route to the
+global STS endpoint, set `C7N_USE_STS_REGIONAL=true` in the agent's environment so Cloud Custodian assumes roles through
+the regional STS endpoint (for example a VPC endpoint).
+
+### IAM
+
+- The hub principal (the plugin's own credentials) needs `sts:AssumeRole` on the target roles. Narrow it to them, for
+  example with an `aws:ResourceOrgID` condition or a list of the role ARNs, plus `ec2:DescribeRegions` when any account
+  scans `all` regions.
+- Each target role trusts the hub principal with an `sts:ExternalId` condition, and can also require the session name:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"AWS": "arn:aws:iam::111111111111:role/ccf-agent"},
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {"sts:ExternalId": "<external id>"},
+      "StringLike": {"sts:RoleSessionName": "CloudCustodian@ccf*"}
+    }
+  }]
+}
+```
+
+- The target role's permissions are the AWS managed policies `SecurityAudit` and `job-function/ViewOnlyAccess`, not
+  `ReadOnlyAccess`, which can also read data (S3 objects, DynamoDB items, secrets).
+
+### Remote configuration
+
+Never list `aws_accounts`, `aws_assume_role_name`, `aws_external_id`, `aws_partition` or `aws_session_name_suffix` in
+the agent's `remote_config.overridable_config_flags` (and don't use `*` there for this plugin): a remote
+overlay could then point the plugin at other accounts or roles without an operator's review.
 
 ## Standardized Per-Resource OPA Input
 
@@ -153,7 +252,9 @@ Each resource/check iteration produces one payload with this shape:
 ```
 
 Generated evidence labels include `resource_id`, `resource_type`, `provider`,
-and any available `account_id`/`region`. A region in the resource data is used
+and any available `account_id`/`region` (with `aws_accounts`: the scanned
+account's `account_id`, its `account_name`, and an `account` object in the
+payload, see [Cross-Account Scanning](#cross-account-scanning)). A region in the resource data is used
 as is; otherwise, when Cloud Custodian wrote per-region output, `region` is the
 region directory the resource came from. Global resource types (IAM, CloudFront,
 Route 53) and resources returned identically by every region (S3 buckets, which
@@ -241,7 +342,8 @@ plugins:
 
 - Cloud Custodian CLI must be installed and executable.
 - Cloud/provider credentials must be available in the plugin process environment
-  (ambient credentials/profile/env vars).
+  (ambient credentials/profile/env vars). With `aws_accounts`, these are the hub's
+  credentials, used to assume each account's role.
 
 ## Testing
 
