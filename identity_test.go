@@ -2,7 +2,10 @@ package main
 
 import (
 	"maps"
+	"os"
+	"regexp"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/go-hclog"
@@ -178,6 +181,32 @@ func TestAWSIdentityTableCoversEveryKnownResourceType(t *testing.T) {
 	}
 	if !slices.Equal(caseTypes, wantCaseTypes) {
 		t.Fatalf("identity cases cover %v, want every known type %v", caseTypes, wantCaseTypes)
+	}
+}
+
+// TestREADMEIdentityTableMatchesCode keeps the README's Resource Identity
+// table equal to awsResourceIdentityFields.
+func TestREADMEIdentityTableMatchesCode(t *testing.T) {
+	content, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	row := regexp.MustCompile("^\\| `aws\\.([a-z0-9-]+)` \\| (.+) \\|$")
+	field := regexp.MustCompile("`([^`]+)`")
+	documented := map[string][]string{}
+	for _, line := range strings.Split(string(content), "\n") {
+		match := row.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		fields := []string{}
+		for _, f := range field.FindAllStringSubmatch(match[2], -1) {
+			fields = append(fields, f[1])
+		}
+		documented[match[1]] = fields
+	}
+	if !maps.EqualFunc(documented, awsResourceIdentityFields, slices.Equal[[]string]) {
+		t.Fatalf("README identity table %v differs from awsResourceIdentityFields %v", documented, awsResourceIdentityFields)
 	}
 }
 
