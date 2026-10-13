@@ -83,6 +83,44 @@ var awsResourceServices = map[string][]string{
 	"wafv2":           {"wafv2"},
 }
 
+// awsResourceIdentityFields is the built-in identity of each AWS resource type,
+// keyed like awsResourceServices: the ARN attribute first, then the natural id.
+// It follows the resource_type `arn` and `id` metadata of Cloud Custodian
+// 0.9.49; where c7n declares no `arn` attribute but the describe API returns
+// one in the record (cache-cluster, transfer-server), that field is used. Types
+// whose records carry no ARN (ebs, ec2, s3, hostedzone) use the natural id;
+// hosted zone ids are turned into ARNs by canonicalResourceID.
+var awsResourceIdentityFields = map[string][]string{
+	"app-elb":         {"LoadBalancerArn"},
+	"backup-plan":     {"BackupPlanArn", "BackupPlanName"},
+	"backup-vault":    {"BackupVaultArn", "BackupVaultName"},
+	"cache-cluster":   {"ARN", "CacheClusterId"},
+	"distribution":    {"ARN", "Id"},
+	"dynamodb-table":  {"TableArn", "TableName"},
+	"ebs":             {"VolumeId"},
+	"ec2":             {"InstanceId"},
+	"ecs-service":     {"serviceArn"},
+	"efs":             {"FileSystemArn", "FileSystemId"},
+	"eks":             {"arn", "name"},
+	"firewall":        {"FirewallArn", "FirewallName"},
+	"hostedzone":      {"Id"},
+	"iam-group":       {"Arn", "GroupName"},
+	"iam-policy":      {"Arn", "PolicyId"},
+	"iam-role":        {"Arn", "RoleName"},
+	"iam-user":        {"Arn", "UserName"},
+	"kms-key":         {"Arn", "KeyId"},
+	"lambda":          {"FunctionArn", "FunctionName"},
+	"log-group":       {"arn", "logGroupName"},
+	"rds":             {"DBInstanceArn", "DBInstanceIdentifier"},
+	"rds-cluster":     {"DBClusterArn", "DBClusterIdentifier"},
+	"s3":              {"Name"},
+	"secrets-manager": {"ARN", "Name"},
+	"sns":             {"TopicArn"},
+	"sqs":             {"QueueArn", "QueueUrl"},
+	"transfer-server": {"Arn", "ServerId"},
+	"wafv2":           {"ARN", "Id"},
+}
+
 var awsGlobalEndpointServices = map[string]string{
 	"cloudfront": "cloudfront.amazonaws.com",
 	"iam":        "iam.amazonaws.com",
@@ -2042,6 +2080,7 @@ func (p *CloudCustodianPlugin) identityFieldPaths(resourceType string) []string 
 			paths = append(paths, configured...)
 		}
 	}
+	paths = append(paths, awsBuiltinIdentityFields(resourceType)...)
 	paths = append(paths,
 		"Arn",
 		"ARN",
@@ -2058,6 +2097,12 @@ func (p *CloudCustodianPlugin) identityFieldPaths(resourceType string) []string 
 		"name",
 	)
 	return compactUniqueStrings(paths)
+}
+
+// awsBuiltinIdentityFields returns the built-in identity fields for an AWS
+// resource type ("aws.lambda" or "lambda"), or nil for other types.
+func awsBuiltinIdentityFields(resourceType string) []string {
+	return awsResourceIdentityFields[strings.TrimPrefix(strings.TrimSpace(resourceType), "aws.")]
 }
 
 func compactUniqueStrings(values []string) []string {
