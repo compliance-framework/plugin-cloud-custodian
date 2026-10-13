@@ -145,6 +145,13 @@ type PluginConfig struct {
 	DebugDumpPayloads                   string `mapstructure:"debug_dump_payloads"`
 	DebugPayloadOutputDir               string `mapstructure:"debug_payload_output_dir"`
 	PreserveArtifacts                   string `mapstructure:"preserve_execution_artifacts"`
+	// AWSAccounts lists the AWS accounts to scan (JSON or YAML in a string).
+	// Unset, the plugin scans the account of its ambient credentials only.
+	AWSAccounts          string `mapstructure:"aws_accounts"`
+	AWSAssumeRoleName    string `mapstructure:"aws_assume_role_name"`
+	AWSExternalID        string `mapstructure:"aws_external_id"`
+	AWSPartition         string `mapstructure:"aws_partition"`
+	AWSSessionNameSuffix string `mapstructure:"aws_session_name_suffix"`
 }
 
 // ParsedConfig stores normalized and validated values for runtime use.
@@ -165,6 +172,10 @@ type ParsedConfig struct {
 	DebugDumpPayloads                   bool
 	DebugPayloadOutputDir               string
 	PreserveArtifacts                   bool
+	// AWSAccounts is nil unless aws_accounts is set (accounts mode).
+	AWSAccounts []AWSAccount
+	// AWSSessionNameSuffix is C7N_SESSION_SUFFIX in accounts mode.
+	AWSSessionNameSuffix string
 }
 
 func (c *PluginConfig) Parse() (*ParsedConfig, error) {
@@ -234,6 +245,10 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 	}
 
 	awsRegions := parseDelimitedList(c.AWSRegions)
+	awsAccounts, awsSessionNameSuffix, err := parseAWSAccountSettings(c, awsRegions)
+	if err != nil {
+		return nil, err
+	}
 	networkDiagnosticEndpoints := parseDelimitedList(c.CustodianNetworkDiagnosticEndpoints)
 
 	custodianDebug, err := parseOptionalBool("custodian_debug", c.CustodianDebug)
@@ -296,6 +311,8 @@ func (c *PluginConfig) Parse() (*ParsedConfig, error) {
 		DebugDumpPayloads:                   debugDumpPayloads,
 		DebugPayloadOutputDir:               debugPayloadOutputDir,
 		PreserveArtifacts:                   preserveArtifacts,
+		AWSAccounts:                         awsAccounts,
+		AWSSessionNameSuffix:                awsSessionNameSuffix,
 	}, nil
 }
 
@@ -2491,7 +2508,12 @@ func (p *CloudCustodianPlugin) Configure(req *proto.ConfigureRequest) (*proto.Co
 		"custodian_network_diagnostic_endpoints", parsed.CustodianNetworkDiagnosticEndpoints,
 		"custodian_log_tail_during_run", parsed.CustodianLogTail,
 		"preserve_execution_artifacts", parsed.PreserveArtifacts,
+		"aws_accounts", awsAccountsLogSummary(parsed.AWSAccounts),
+		"aws_session_name_suffix", parsed.AWSSessionNameSuffix,
 	)
+	if ignored := ignoredAWSAccountKeys(config); len(ignored) > 0 {
+		p.Logger.Warn("AWS account settings have no effect without aws_accounts", "keys", ignored)
+	}
 
 	resolvedPolicies, err := resolvePoliciesYAML(context.Background(), parsed.PoliciesYAML, parsed.PoliciesPath)
 	if err != nil {

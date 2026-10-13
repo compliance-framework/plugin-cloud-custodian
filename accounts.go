@@ -1,0 +1,311 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"slices"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	defaultAWSPartition         = "aws"
+	defaultAWSSessionNameSuffix = "ccf"
+	// c7n names its STS sessions "CloudCustodian", or "CloudCustodian@<suffix>"
+	// when C7N_SESSION_SUFFIX is set (c7n credentials.py SessionFactory).
+	custodianSessionNamePrefix = "CloudCustodian@"
+	// STS RoleSessionName is at most 64 characters.
+	maxAWSRoleSessionNameLength = 64
+	minAWSExternalIDLength      = 2
+	maxAWSExternalIDLength      = 1224
+)
+
+var (
+	awsAccountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
+	awsPartitionPattern = regexp.MustCompile(`^aws(-[a-z]+)*$`)
+	// IAM role names may carry a path (path/name); names use [\w+=,.@-].
+	awsRoleNamePattern = regexp.MustCompile(`^[A-Za-z0-9_+=,.@-]+(/[A-Za-z0-9_+=,.@-]+)*$`)
+	awsRoleARNPattern  = regexp.MustCompile(`^arn:(aws(?:-[a-z]+)*):iam::([0-9]{12}):role/(.+)$`)
+	// STS ExternalId and RoleSessionName character sets.
+	awsExternalIDPattern     = regexp.MustCompile(`^[A-Za-z0-9_+=,.@:/-]+$`)
+	awsSessionSuffixPattern  = regexp.MustCompile(`^[A-Za-z0-9_+=,.@-]+$`)
+	unresolvedEnvPlaceholder = "${env:"
+)
+
+// awsAccountEntry is one aws_accounts entry as configured.
+type awsAccountEntry struct {
+	ID                    string   `yaml:"id"`
+	Name                  string   `yaml:"name"`
+	RoleARN               string   `yaml:"role_arn"`
+	RoleName              string   `yaml:"role_name"`
+	ExternalID            string   `yaml:"external_id"`
+	Regions               []string `yaml:"regions"`
+	UseAmbientCredentials bool     `yaml:"use_ambient_credentials"`
+}
+
+// AWSAccount is a validated aws_accounts entry with every default applied.
+type AWSAccount struct {
+	ID   string
+	Name string
+	// RoleARN is the role c7n assumes (--assume); empty for an ambient account.
+	RoleARN string
+	// ExternalID is passed with --external-id when set. Never log it.
+	ExternalID string
+	// Regions are the entry's own regions; empty means aws_regions, then all.
+	Regions               []string
+	UseAmbientCredentials bool
+}
+
+// Label returns "<id> (<name>)", or the id when the account has no name.
+func (a AWSAccount) Label() string {
+	if a.Name == "" {
+		return a.ID
+	}
+	return fmt.Sprintf("%s (%s)", a.ID, a.Name)
+}
+
+// awsAccountDefaults are the plugin-level values aws_accounts entries fall back to.
+type awsAccountDefaults struct {
+	AssumeRoleName string
+	ExternalID     string
+	Partition      string
+	Regions        []string
+}
+
+// parseAWSAccountSettings parses aws_accounts and the keys that only apply to
+// it. Without aws_accounts it returns no accounts and no error, whatever the
+// other keys hold: the plugin then behaves exactly as it did before accounts
+// existed.
+func parseAWSAccountSettings(c *PluginConfig, awsRegions []string) ([]AWSAccount, string, error) {
+	if strings.TrimSpace(c.AWSAccounts) == "" {
+		return nil, "", nil
+	}
+
+	defaults := awsAccountDefaults{
+		AssumeRoleName: strings.TrimSpace(c.AWSAssumeRoleName),
+		ExternalID:     strings.TrimSpace(c.AWSExternalID),
+		Partition:      strings.TrimSpace(c.AWSPartition),
+		Regions:        awsRegions,
+	}
+	if defaults.AssumeRoleName != "" && !awsRoleNamePattern.MatchString(defaults.AssumeRoleName) {
+		return nil, "", fmt.Errorf("aws_assume_role_name %q is not a valid IAM role name", defaults.AssumeRoleName)
+	}
+	if defaults.ExternalID != "" {
+		if err := validateAWSExternalID(defaults.ExternalID); err != nil {
+			return nil, "", fmt.Errorf("aws_external_id %w", err)
+		}
+	}
+	if defaults.Partition != "" && !awsPartitionPattern.MatchString(defaults.Partition) {
+		return nil, "", fmt.Errorf("aws_partition %q is not an AWS partition such as aws, aws-cn or aws-us-gov", defaults.Partition)
+	}
+
+	sessionSuffix := strings.TrimSpace(c.AWSSessionNameSuffix)
+	if sessionSuffix == "" {
+		sessionSuffix = defaultAWSSessionNameSuffix
+	}
+	if !awsSessionSuffixPattern.MatchString(sessionSuffix) {
+		return nil, "", fmt.Errorf("aws_session_name_suffix %q may only contain letters, digits and _+=,.@-", sessionSuffix)
+	}
+	if len(custodianSessionNamePrefix)+len(sessionSuffix) > maxAWSRoleSessionNameLength {
+		return nil, "", fmt.Errorf("aws_session_name_suffix is too long: the STS session name %q%s exceeds %d characters",
+			custodianSessionNamePrefix, sessionSuffix, maxAWSRoleSessionNameLength)
+	}
+
+	accounts, err := parseAWSAccounts(c.AWSAccounts, defaults)
+	if err != nil {
+		return nil, "", err
+	}
+	return accounts, sessionSuffix, nil
+}
+
+// parseAWSAccounts decodes aws_accounts (JSON, or YAML) and validates every
+// entry. Errors name the entry but never contain an external ID.
+func parseAWSAccounts(raw string, defaults awsAccountDefaults) ([]AWSAccount, error) {
+	decoder := yaml.NewDecoder(bytes.NewBufferString(raw))
+	decoder.KnownFields(true)
+	var entries []awsAccountEntry
+	if err := decoder.Decode(&entries); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("aws_accounts must list at least one account")
+		}
+		return nil, fmt.Errorf("could not parse aws_accounts: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("aws_accounts must list at least one account")
+	}
+
+	accounts := make([]AWSAccount, 0, len(entries))
+	seen := map[string]int{}
+	ambientIndex := -1
+	for index, entry := range entries {
+		account, err := resolveAWSAccount(entry, defaults)
+		if err != nil {
+			return nil, fmt.Errorf("aws_accounts[%d]: %w", index, err)
+		}
+		if previous, ok := seen[account.ID]; ok {
+			return nil, fmt.Errorf("aws_accounts[%d]: id %s is already listed at aws_accounts[%d]", index, account.ID, previous)
+		}
+		seen[account.ID] = index
+		if account.UseAmbientCredentials {
+			// Ambient credentials belong to one account: a second ambient entry
+			// would scan that same account again under another id.
+			if ambientIndex >= 0 {
+				return nil, fmt.Errorf("aws_accounts[%d]: only one account may set use_ambient_credentials (aws_accounts[%d] already does)", index, ambientIndex)
+			}
+			ambientIndex = index
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts, nil
+}
+
+func resolveAWSAccount(entry awsAccountEntry, defaults awsAccountDefaults) (AWSAccount, error) {
+	id := strings.TrimSpace(entry.ID)
+	if !awsAccountIDPattern.MatchString(id) {
+		return AWSAccount{}, fmt.Errorf("id %q must be a 12-digit AWS account ID", id)
+	}
+	account := AWSAccount{
+		ID:                    id,
+		Name:                  strings.TrimSpace(entry.Name),
+		UseAmbientCredentials: entry.UseAmbientCredentials,
+	}
+	if regions := compactUniqueStrings(entry.Regions); len(regions) > 0 {
+		account.Regions = regions
+	}
+	roleARN := strings.TrimSpace(entry.RoleARN)
+	roleName := strings.TrimSpace(entry.RoleName)
+	externalID := strings.TrimSpace(entry.ExternalID)
+
+	if account.UseAmbientCredentials {
+		if roleARN != "" || roleName != "" || externalID != "" {
+			return AWSAccount{}, fmt.Errorf("account %s sets use_ambient_credentials, which cannot be combined with role_arn, role_name or external_id", id)
+		}
+		return account, nil
+	}
+
+	switch {
+	case roleARN != "":
+		match := awsRoleARNPattern.FindStringSubmatch(roleARN)
+		if match == nil {
+			return AWSAccount{}, fmt.Errorf("account %s: role_arn %q is not an IAM role ARN (arn:<partition>:iam::<account>:role/<name>)", id, roleARN)
+		}
+		if match[2] != id {
+			return AWSAccount{}, fmt.Errorf("account %s: role_arn %q belongs to account %s", id, roleARN, match[2])
+		}
+		account.RoleARN = roleARN
+	case roleName != "" || defaults.AssumeRoleName != "":
+		if roleName == "" {
+			roleName = defaults.AssumeRoleName
+		} else if !awsRoleNamePattern.MatchString(roleName) {
+			return AWSAccount{}, fmt.Errorf("account %s: role_name %q is not a valid IAM role name", id, roleName)
+		}
+		partition, err := awsAccountPartition(defaults.Partition, account.Regions, defaults.Regions)
+		if err != nil {
+			return AWSAccount{}, fmt.Errorf("account %s: %w", id, err)
+		}
+		account.RoleARN = awsRoleARN(partition, id, roleName)
+	default:
+		return AWSAccount{}, fmt.Errorf("account %s needs role_arn, role_name, aws_assume_role_name or use_ambient_credentials: true", id)
+	}
+
+	if externalID != "" {
+		if err := validateAWSExternalID(externalID); err != nil {
+			return AWSAccount{}, fmt.Errorf("account %s: external_id %w", id, err)
+		}
+		account.ExternalID = externalID
+	} else {
+		account.ExternalID = defaults.ExternalID
+	}
+	return account, nil
+}
+
+// validateAWSExternalID checks an external ID against STS's limits. The error
+// never repeats the value.
+func validateAWSExternalID(value string) error {
+	if strings.Contains(value, unresolvedEnvPlaceholder) {
+		return errors.New("contains an unresolved ${env:...} placeholder; set the environment variable on the agent")
+	}
+	if len(value) < minAWSExternalIDLength || len(value) > maxAWSExternalIDLength {
+		return fmt.Errorf("must be %d to %d characters long, got %d", minAWSExternalIDLength, maxAWSExternalIDLength, len(value))
+	}
+	if !awsExternalIDPattern.MatchString(value) {
+		return errors.New("may only contain letters, digits and _+=,.@:/-")
+	}
+	return nil
+}
+
+func awsRoleARN(partition, accountID, roleName string) string {
+	return fmt.Sprintf("arn:%s:iam::%s:role/%s", partition, accountID, roleName)
+}
+
+// awsAccountPartition is the partition of a role_name ARN: aws_partition when
+// set, else the single partition of the account's effective regions (its own,
+// then aws_regions; aws when there are none or only "all").
+func awsAccountPartition(configured string, accountRegions, defaultRegions []string) (string, error) {
+	if configured != "" {
+		return configured, nil
+	}
+	regions := accountRegions
+	if len(regions) == 0 {
+		regions = defaultRegions
+	}
+	partitions := make([]string, 0, 1)
+	for _, region := range regions {
+		if strings.EqualFold(region, "all") {
+			continue
+		}
+		partition := awsPartitionForRegion(region)
+		if !slices.Contains(partitions, partition) {
+			partitions = append(partitions, partition)
+		}
+	}
+	switch len(partitions) {
+	case 0:
+		return defaultAWSPartition, nil
+	case 1:
+		return partitions[0], nil
+	default:
+		return "", fmt.Errorf("regions %s span the partitions %s; set aws_partition or use role_arn",
+			strings.Join(regions, ","), strings.Join(partitions, ","))
+	}
+}
+
+// awsAccountsLogSummary describes the accounts for logs, without external IDs.
+func awsAccountsLogSummary(accounts []AWSAccount) []map[string]interface{} {
+	summary := make([]map[string]interface{}, 0, len(accounts))
+	for _, account := range accounts {
+		summary = append(summary, map[string]interface{}{
+			"id":                      account.ID,
+			"name":                    account.Name,
+			"role_arn":                account.RoleARN,
+			"has_external_id":         account.ExternalID != "",
+			"use_ambient_credentials": account.UseAmbientCredentials,
+			"regions":                 account.Regions,
+		})
+	}
+	return summary
+}
+
+// ignoredAWSAccountKeys lists the account keys that are set although
+// aws_accounts is not, so Configure can warn that they have no effect.
+func ignoredAWSAccountKeys(c *PluginConfig) []string {
+	if strings.TrimSpace(c.AWSAccounts) != "" {
+		return nil
+	}
+	keys := make([]string, 0)
+	for _, key := range []struct{ name, value string }{
+		{"aws_assume_role_name", c.AWSAssumeRoleName},
+		{"aws_external_id", c.AWSExternalID},
+		{"aws_partition", c.AWSPartition},
+		{"aws_session_name_suffix", c.AWSSessionNameSuffix},
+	} {
+		if strings.TrimSpace(key.value) != "" {
+			keys = append(keys, key.name)
+		}
+	}
+	return keys
+}
