@@ -5,9 +5,9 @@ go 1.26.1
 require (
 	github.com/compliance-framework/agent v0.9.3
 	github.com/hashicorp/go-hclog v1.6.3
-	github.com/hashicorp/go-plugin v1.7.0
+	github.com/hashicorp/go-plugin v1.8.0
 	github.com/mitchellh/mapstructure v1.5.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
 
