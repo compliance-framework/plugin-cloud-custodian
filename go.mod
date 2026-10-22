@@ -3,7 +3,7 @@ module github.com/compliance-framework/plugin-cloud-custodian
 go 1.26.1
 
 require (
-	github.com/compliance-framework/agent v0.9.2
+	github.com/compliance-framework/agent v0.9.3
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.7.0
 	github.com/mitchellh/mapstructure v1.5.0
