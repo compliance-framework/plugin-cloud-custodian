@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1](https://github.com/compliance-framework/plugin-cloud-custodian/compare/v0.3.0...v0.3.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **deps:** bump agent to v0.9.3, workflows to v1.7.0 ([#46](https://github.com/compliance-framework/plugin-cloud-custodian/issues/46)) ([927e8e2](https://github.com/compliance-framework/plugin-cloud-custodian/commit/927e8e2759b531a91dd6b69bb723f53bace347e3))
+* **deps:** bump agent to v0.9.4 ([#49](https://github.com/compliance-framework/plugin-cloud-custodian/issues/49)) ([b44b79c](https://github.com/compliance-framework/plugin-cloud-custodian/commit/b44b79c84e737360d48176f0b35eeed221a503c2))
+* **deps:** update all non-major dependencies ([#48](https://github.com/compliance-framework/plugin-cloud-custodian/issues/48)) ([6e36239](https://github.com/compliance-framework/plugin-cloud-custodian/commit/6e362393a47c79b8f5f6cac23a4971225fd5bc7e))
+
 ## [0.3.0](https://github.com/compliance-framework/plugin-cloud-custodian/compare/v0.2.8...v0.3.0) (2026-10-14)
 
 
