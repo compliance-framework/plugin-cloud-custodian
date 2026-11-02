@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2](https://github.com/compliance-framework/plugin-cloud-custodian/compare/v0.3.1...v0.3.2) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** build with the go1.26.10 toolchain so Renovate can ship Go security fixes ([#50](https://github.com/compliance-framework/plugin-cloud-custodian/issues/50)) ([ba31535](https://github.com/compliance-framework/plugin-cloud-custodian/commit/ba31535f567a88aa19d0e7f400dd0951e5289e96))
+* **deps:** bump agent to v0.9.6 ([#54](https://github.com/compliance-framework/plugin-cloud-custodian/issues/54)) ([d2c4d91](https://github.com/compliance-framework/plugin-cloud-custodian/commit/d2c4d91dac7761c5a2d585e620c074046f8e15fe))
+
 ## [0.3.1](https://github.com/compliance-framework/plugin-cloud-custodian/compare/v0.3.0...v0.3.1) (2026-10-28)
 
 
