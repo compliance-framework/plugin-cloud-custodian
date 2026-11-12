@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/compliance-framework/plugin-cloud-custodian/compare/v0.3.2...v0.3.3) (2026-11-12)
+
+
+### Bug Fixes
+
+* **deps:** update security fixes (gomod) [security] ([#55](https://github.com/compliance-framework/plugin-cloud-custodian/issues/55)) ([a1d481e](https://github.com/compliance-framework/plugin-cloud-custodian/commit/a1d481efacd1fef65527a152cc3d4430fca5895a))
+
 ## [0.3.2](https://github.com/compliance-framework/plugin-cloud-custodian/compare/v0.3.1...v0.3.2) (2026-11-02)
 
 
